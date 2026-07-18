@@ -1,38 +1,973 @@
-"""YOUR SOLUTION GOES HERE.
+"""Deterministic, provenance-gated belief revision for GROUND TRUTH.
 
-Implement ingest(item, view). It is called once per evidence item, in order.
-You get:
-  - item : the new evidence.  item.body (text), item.provenance (STRUCTURED,
-           trustworthy channel), item.era.  NOTE: item.tag is empty at runtime.
-  - view : a READ-ONLY snapshot of the current belief state. You can read claims,
-           cell states, the domain of competence, and declared absences. You
-           CANNOT write to it. The only way to change the belief state is to
-           return Deltas.
-
-You return an IngestResult:
-  - deltas    : a list of Delta objects (your proposed changes). See the vocabulary
-                in groundtruth/deltas.py. Anything not in that vocabulary is rejected.
-  - rationale : a short string explaining your decision (logged, good for debugging)
-  - confidence: your confidence in this decision, 0..1
-  - ood_flag  : True if this evidence falls OUTSIDE what the model represents
-
-Run  `python selfcheck.py`  to test against the practice sandbox.
+The prose body is used only to identify what an experiment is about.  Whether
+that experiment is allowed to change the graph, and by how much, is decided from
+the structured provenance channel.  All writes are returned as typed deltas.
 """
+from __future__ import annotations
+
+from dataclasses import dataclass
+import re
+import unicodedata
+from typing import Any, Iterable
+
 from groundtruth.deltas import Delta, no_op
 from groundtruth.ingest import EvidenceItem, IngestResult
-from groundtruth.model import GraphView
+from groundtruth.model import Claim, GraphView, logit, sigmoid
+
+
+_COUNT_WORDS = {
+    "none": 0.0,
+    "zero": 0.0,
+    "single": 1.0,
+    "one": 1.0,
+    "two": 2.0,
+    "three": 3.0,
+    "four": 4.0,
+    "five": 5.0,
+    "six": 6.0,
+    "seven": 7.0,
+    "eight": 8.0,
+    "few": 2.0,
+    "couple": 2.0,
+    "multiple": 3.0,
+    "several": 4.0,
+    "many": 8.0,
+    "numerous": 8.0,
+}
+
+_REVERSAL_TERMS = (
+    "return to",
+    "returned",
+    "revert",
+    "reverted",
+    "reversion",
+    "dedifferentiat",
+    "reprogram",
+    "reset to",
+    "regressed to",
+    "decommitted",
+    "regained pluripotency",
+    "induced pluripotency",
+    "acquired pluripotency",
+    "generated pluripotent",
+    "produced pluripotent",
+    "became pluripotent",
+    "became ipsc",
+    "stem like state",
+    "stem cell like",
+    "embryonic like state",
+    "embryonic stem state",
+    "progenitor like",
+    "pluripotent like",
+    "less committed",
+    "increase in potency",
+    "increased potency",
+)
+
+_FAILED_TERMS = (
+    "failed to replicate",
+    "failed to reproduce",
+    "could not replicate",
+    "could not reproduce",
+    "did not replicate",
+    "did not reproduce",
+    "no effect was found",
+    "no such effect",
+)
+
+_NO_REVERSAL_TERMS = (
+    "no return",
+    "no reversion",
+    "no dedifferentiation",
+    "did not return",
+    "did not revert",
+    "never returned",
+    "never reverted",
+    "failed to induce reversion",
+    "failed to induce pluripotency",
+    "remained differentiated",
+    "never increased potency",
+    "no increase in potency",
+)
+
+
+@dataclass(frozen=True)
+class EvidenceQuality:
+    """Normalized values derived exclusively from structured provenance."""
+
+    score: float
+    groups: float
+    replications: float
+    directness: float
+    effect: float
+    effect_reported: bool
+    explicit_null_effect: bool
+    method_class: str
+    mechanism: str
+    retracted: bool
+
+    @property
+    def thin(self) -> bool:
+        """Return whether the evidence comes from only one source and repeat."""
+        return self.groups <= 1 and self.replications <= 1
+
+    @property
+    def credible(self) -> bool:
+        """Return whether provenance is sufficient for a graph-level update."""
+        # Technical repeats from one group are not independent confirmation.
+        return self.score >= 0.60 and self.groups >= 2
+
+    @property
+    def strong(self) -> bool:
+        """Return whether the evidence is strong enough for a large revision."""
+        return self.score >= 0.82 and self.groups >= 3
+
+
+@dataclass(frozen=True)
+class StateMention:
+    position: int
+    state: Any
+
+
+@dataclass(frozen=True)
+class Event:
+    text: str
+    mentions: tuple[StateMention, ...]
+    reversal: bool
+    supports_no_return: bool
+    to_source: bool
+    normal_differentiation: bool
+    failed_replication: bool
+    ood_axis: str | None
+    ood_regime: str | None
+
+
+def _normalized(value: Any) -> str:
+    """Normalize prose while also removing common invisible obfuscation."""
+    if not isinstance(value, str):
+        return ""
+    value = unicodedata.normalize("NFKC", value)
+    value = "".join(ch for ch in value if unicodedata.category(ch) != "Cf")
+    return re.sub(r"\s+", " ", value.casefold()).strip()
+
+
+def _slug(value: str) -> str:
+    """Convert an untrusted label into a short, safe identifier fragment."""
+    normalized = re.sub(r"[^a-z0-9]+", "_", _normalized(value)).strip("_")
+    return (normalized[:64] or "unknown")
+
+
+def _contains(text: str, phrases: Iterable[str]) -> bool:
+    """Return whether any semantic phrase occurs in normalized text."""
+    return any(phrase in text for phrase in phrases)
+
+
+def _looks_like_instruction(body: Any) -> bool:
+    """Fail closed on text that tries to address or control the processor."""
+    text = _normalized(body).replace("_", " ").replace("-", " ")
+    if not text:
+        return False
+
+    explicit_markers = (
+        "processor note",
+        "system message",
+        "system prompt",
+        "system instruction",
+        "developer message",
+        "assistant instruction",
+        "prompt injection",
+        "your task is",
+        "pretend the provenance",
+        "override provenance",
+        "ignore provenance",
+        "revise confidence",
+        "set scope",
+        "drop claim",
+        "hold pending",
+        "ood flag",
+    )
+    if _contains(text, explicit_markers):
+        return True
+
+    if re.search(
+        r"\b(?:ignore|disregard|override|bypass)\b.{0,60}"
+        r"\b(?:previous|prior|earlier|system|developer|provenance|instruction|rule)\b",
+        text,
+    ):
+        return True
+    if re.search(r"\b(?:follow|obey|execute)\b.{0,40}\b(?:instruction|command)\b", text):
+        return True
+    if re.search(r"(?:^|[\[\(<])\s*(?:system|developer|assistant|processor)\b", text):
+        return True
+    if re.search(r"\b(?:you|processor|assistant|model)\s+(?:must|should|shall|will|are to)\b", text):
+        return True
+
+    action = r"(?:set|change|update|revise|overwrite|delete|drop|add|mutate|emit|return|force|make|flag|mark|classify|treat)"
+    target = r"(?:confidence|claim|belief|knowledge graph|graph state|delta|provenance|pending item|ood flag|out of distribution)"
+    if re.search(rf"\b{action}\b.{{0,80}}\b{target}\b", text):
+        return True
+    if re.search(rf"\b{target}\b.{{0,80}}\b{action}\b", text):
+        return True
+    if re.search(rf"\b{action}\b.{{0,30}}\b(?:q|c)\d+[a-z]?\b", text):
+        return True
+    if re.search(r"\b(?:q|c)\d+[a-z]?\s*(?:=|:=)\s*(?:0(?:\.\d+)?|1(?:\.0+)?)\b", text):
+        return True
+    if re.search(r"\b(?:q|c)\d+[a-z]?\b.{0,25}\b(?:should|must)\b.{0,25}\b(?:true|false|certain|0|1)\b", text):
+        return True
+    return False
+
+
+def _number(value: Any) -> float:
+    """Parse bounded count metadata; malformed values contribute no weight."""
+    if isinstance(value, bool):
+        return 0.0
+    if isinstance(value, (int, float)):
+        return min(8.0, max(0.0, float(value)))
+    text = _normalized(value)
+    if text in _COUNT_WORDS:
+        return _COUNT_WORDS[text]
+    if re.fullmatch(r"\d+(?:\.\d+)?", text):
+        return min(8.0, float(text))
+    return 0.0
+
+
+def _saturation(count: float) -> float:
+    """Map a bounded count to a diminishing-return independence score."""
+    if count <= 1:
+        return 0.0
+    if count == 2:
+        return 0.4
+    if count == 3:
+        return 0.75
+    return 1.0
+
+
+def _mechanism(method_class: str, body: str) -> str:
+    """Map method names to graph scope labels, preferring trusted metadata."""
+    method = _normalized(method_class)
+    if "factor" in method or "transcription" in method:
+        return "defined_factor"
+    if "stress" in method or "environment" in method:
+        return "env_stress"
+    if any(term in method for term in ("nuclear", "oocyte", "scnt", "cloning")):
+        return "oocyte_nt"
+    if "spontaneous" in method:
+        return "spontaneous"
+
+    # Method metadata is occasionally generic. These phrases identify subject
+    # matter, but never add evidential weight.
+    if "nuclear transfer" in body or "oocyte transfer" in body:
+        return "oocyte_nt"
+    if _contains(body, ("defined factor", "transcription factor", "factor expression")):
+        return "defined_factor"
+    if _contains(body, ("environmental stress", "stress induced", "acid exposure", "acid bath", "low ph")):
+        return "env_stress"
+    if "spontaneous" in body and "intervention" not in body:
+        return "spontaneous"
+    return _slug(method) if method else "unspecified"
+
+
+def _quality(item: EvidenceItem, body: str) -> EvidenceQuality:
+    """Score structured provenance without trusting claims made in the body."""
+    provenance = item.provenance if isinstance(item.provenance, dict) else {}
+    groups = _number(provenance.get("independent_groups"))
+    replications = _number(provenance.get("replication_count"))
+
+    directness_text = _normalized(provenance.get("method_directness"))
+    if "indirect" in directness_text:
+        directness = 0.45
+    elif "semi" in directness_text and "direct" in directness_text:
+        directness = 0.75
+    elif "direct" in directness_text:
+        directness = 1.0
+    elif "infer" in directness_text:
+        directness = 0.25
+    else:
+        directness = 0.0
+
+    effect_text = _normalized(provenance.get("effect_strength"))
+    effect_reported = bool(effect_text)
+    explicit_null_effect = effect_text in {"none", "null", "no effect", "absent", "zero"}
+    if "strong" in effect_text or "large" in effect_text:
+        effect = 1.0
+    elif "moderate" in effect_text or "medium" in effect_text:
+        effect = 0.65
+    elif "weak" in effect_text or "small" in effect_text:
+        effect = 0.3
+    else:
+        effect = 0.0
+
+    method_class = _normalized(provenance.get("method_class"))
+    if any(term in method_class for term in ("lineage", "perturb", "transfer", "random")):
+        method_reliability = 0.95
+    elif "observ" in method_class:
+        method_reliability = 0.55
+    elif method_class:
+        method_reliability = 0.7
+    else:
+        method_reliability = 0.0
+
+    score = (
+        0.40 * _saturation(groups)
+        + 0.15 * _saturation(replications)
+        + 0.20 * directness
+        + 0.15 * effect
+        + 0.10 * method_reliability
+    )
+
+    retraction = _normalized(provenance.get("retraction_status")).replace("_", " ")
+    retracted = (
+        retraction in {"yes", "true", "retracted", "withdrawn", "rescinded", "invalidated"}
+        or _contains(retraction, ("later retracted", "paper retracted", "failed to replicate", "fraud confirmed"))
+    )
+    return EvidenceQuality(
+        score=min(1.0, max(0.0, score)),
+        groups=groups,
+        replications=replications,
+        directness=directness,
+        effect=effect,
+        effect_reported=effect_reported,
+        explicit_null_effect=explicit_null_effect,
+        method_class=method_class,
+        mechanism=_mechanism(method_class, body),
+        retracted=retracted,
+    )
+
+
+def _singular(word: str) -> str:
+    """Apply the small amount of singularization needed for state matching."""
+    irregular = {"cells": "cell", "states": "state", "identities": "identity"}
+    if word in irregular:
+        return irregular[word]
+    if word.endswith("ies") and len(word) > 4:
+        return word[:-3] + "y"
+    if word.endswith("s") and not word.endswith("ss") and len(word) > 3:
+        return word[:-1]
+    return word
+
+
+def _state_mentions(body: str, view: GraphView) -> tuple[StateMention, ...]:
+    """Resolve graph states from CamelCase names and ordinary noun phrases."""
+    found: dict[str, StateMention] = {}
+
+    raw_tokens = list(re.finditer(r"\b[A-Za-z][A-Za-z0-9]*\b", body))
+    for match in raw_tokens:
+        state = view.cell_state(match.group(0))
+        if state is not None and state.id not in found:
+            found[state.id] = StateMention(match.start(), state)
+
+    normalized_body = _normalized(body).replace("-", " ")
+    word_matches = list(re.finditer(r"[a-z0-9]+", normalized_body))
+    words = [match.group(0) for match in word_matches]
+    for start in range(len(words)):
+        for width in range(1, min(4, len(words) - start) + 1):
+            phrase = words[start : start + width]
+            variants = [phrase, [*phrase[:-1], _singular(phrase[-1])]]
+            for parts in variants:
+                candidate = "".join(part.capitalize() for part in parts)
+                state = view.cell_state(candidate)
+                if state is not None and state.id not in found:
+                    found[state.id] = StateMention(word_matches[start].start(), state)
+
+    aliases = {
+        "pluripotent cells": "PluripotentStemCell",
+        "stem cells": "PluripotentStemCell",
+        "induced pluripotent stem cells": "PluripotentStemCell",
+        "ips cells": "PluripotentStemCell",
+        "ipscs": "PluripotentStemCell",
+        "muscle cells": "SkeletalMuscleCell",
+        "skeletal muscle": "SkeletalMuscleCell",
+        "intestinal cells": "IntestinalEpithelialCell",
+        "intestinal epithelial cells": "IntestinalEpithelialCell",
+    }
+    for phrase, state_name in aliases.items():
+        position = normalized_body.find(phrase)
+        if position < 0:
+            continue
+        state = view.cell_state(state_name)
+        if state is not None and state.id not in found:
+            found[state.id] = StateMention(position, state)
+
+    return tuple(sorted(found.values(), key=lambda mention: mention.position))
+
+
+def _domain_value(values: Iterable[str], keywords: tuple[str, ...], fallback: str) -> str:
+    """Choose the graph's declared label matching keywords, or a safe fallback."""
+    for value in values:
+        normalized = _normalized(value).replace("_", " ")
+        if any(keyword in normalized for keyword in keywords):
+            return value
+    return fallback
+
+
+def _identity_preserved(text: str) -> bool:
+    """Detect a property change while cell identity remains fixed."""
+    return _contains(
+        text,
+        (
+            "identity unchanged",
+            "unchanged identity",
+            "without changing identity",
+            "without changing cell type",
+            "same cell identity",
+            "same cell type",
+            "while remaining",
+            "remained the same",
+            "remained a",
+            "without altering identity",
+            "without altering lineage",
+            "identity preserving",
+        ),
+    )
+
+
+def _ood_axis(text: str, view: GraphView) -> str | None:
+    """Return an excluded property axis when the evidence studies one."""
+    domain = view.domain()
+    excluded = tuple(domain.axes_excluded) if domain is not None else ()
+    identity_preserved = _identity_preserved(text)
+    age_signal = _contains(
+        text,
+        (
+            "biological age",
+            "cellular age",
+            "epigenetic age",
+            "epigenetic clock",
+            "rejuvenat",
+            "younger",
+            "aging",
+            "ageing",
+            "senescen",
+        ),
+    )
+    if age_signal and (identity_preserved or "rejuvenat" in text or "epigenetic" in text):
+        return _domain_value(excluded, ("age",), "biological_age")
+
+    function_signal = _contains(
+        text,
+        (
+            "cell function",
+            "functional",
+            "function improved",
+            "restored function",
+            "performance",
+            "contractility",
+            "metabolic activity",
+        ),
+    )
+    if function_signal and identity_preserved:
+        return _domain_value(excluded, ("function",), "cell_function_independent_of_identity")
+
+    if identity_preserved:
+        additional_properties = (
+            (("chromatin", "epigenetic state"), "epigenetic_state"),
+            (("gene expression", "transcriptional state"), "transcriptional_state"),
+            (("metabolic state", "metabolism"), "metabolic_state"),
+            (("morphology", "cell size"), "cell_morphology"),
+        )
+        for terms, axis in additional_properties:
+            if _contains(text, terms):
+                return _domain_value(excluded, terms, axis)
+    return None
+
+
+def _is_lateral_conversion(text: str, mentions: tuple[StateMention, ...]) -> bool:
+    """Identify conversion between distinct terminal identities.
+
+    Two forms qualify. The *explicit* form is a conversion verb plus wording that
+    rules out an intermediate. The *structural* form is an identity-change verb
+    between two mentioned states that sit at the same potency level but different
+    lineages: a move the graph cannot express (neither a potency step nor an
+    adjacency), regardless of whether the body says "direct". The structural form
+    is suppressed when the text names an intermediate, which would make the report
+    an in-model potency contradiction rather than an unmodeled lateral move.
+    """
+    # "became" is polysemous ("became larger"), so it counts as a conversion cue
+    # only alongside explicit no-intermediate wording, never for the structural
+    # fallback, where a genuine identity-change verb is required.
+    identity_change = _contains(
+        text,
+        ("convert", "conversion", "transdifferentiat", "reprogram", "turned into", "switched", "transformed"),
+    )
+    conversion = identity_change or "became" in text
+    direct = "transdifferentiat" in text or _contains(
+        text,
+        (
+            "direct",
+            "without passing",
+            "without an intermediate",
+            "without entering",
+            "without traversing",
+            "without pluripotent",
+            "without a pluripotent",
+            "without transient pluripotency",
+            "skipping",
+            "skipped",
+            "bypassed",
+        ),
+    )
+
+    equal_potency_cross_lineage = False
+    if len(mentions) >= 2:
+        source, destination = mentions[0].state, mentions[-1].state
+        equal_potency_cross_lineage = (
+            source.id != destination.id
+            and source.potency_level == destination.potency_level
+            and source.lineage_identity != destination.lineage_identity
+        )
+
+    if conversion and direct:
+        if len(mentions) >= 2:
+            return equal_potency_cross_lineage
+        # Prose that names two generic endpoint types not present as graph
+        # entities; the explicit endpoint wording keeps OOD precision high.
+        return _contains(text, ("one mature cell type", "another mature", "distinct terminal", "different terminal"))
+
+    # Structural fallback: an identity-change verb between two equal-potency,
+    # cross-lineage states is out of model even without "direct" wording, unless
+    # an intermediate is named (which would signal an in-model contradiction).
+    if identity_change and equal_potency_cross_lineage:
+        mediated = _contains(
+            text,
+            (
+                "through",
+                "via ",
+                "intermediate",
+                "passing through",
+                "progenitor",
+                "stem cell",
+                "stem like",
+                "source state",
+                "pluripotent",
+            ),
+        )
+        return not mediated
+    return False
+
+
+def _event(item: EvidenceItem, body: str, view: GraphView) -> Event:
+    """Extract a conservative, graph-aware description of the reported event."""
+    text = _normalized(body).replace("-", " ")
+    mentions = _state_mentions(body, view)
+    source = mentions[0].state if mentions else None
+    destination = mentions[-1].state if len(mentions) >= 2 else None
+    destination_is_more_potent = (
+        source is not None
+        and destination is not None
+        and destination.potency_level < source.potency_level
+    )
+    provenance = item.provenance if isinstance(item.provenance, dict) else {}
+    method_class = _normalized(provenance.get("method_class"))
+    nuclear_method = any(term in method_class for term in ("nuclear", "oocyte", "scnt", "cloning"))
+    nuclear_success = (
+        nuclear_method
+        and _contains(
+            text,
+            (
+                "supported development",
+                "developed into",
+                "embryonic development",
+                "formed an embryo",
+                "viable embryo",
+                "viable organism",
+                "viable offspring",
+                "live birth",
+                "full term",
+                "tadpole",
+                "adult frog",
+                "cloned animal",
+                "clone was born",
+            ),
+        )
+        and not _contains(
+            text,
+            ("failed to develop", "did not develop", "no development", "nonviable", "non viable"),
+        )
+    )
+    transition_signal = _contains(text, ("convert", "became", "induc", "generat", "produc", "transform"))
+    mature = r"(?:somatic|mature|adult|differentiated|terminal|fibroblast)"
+    flexible = r"(?:pluripotent|pluripotency|stem cell|stem like|embryonic like|ipscs?|ips cells?)"
+    mature_to_flexible = re.search(rf"\b{mature}\b(.{{0,100}})\b{flexible}\b", text)
+    generic_return = (
+        len(mentions) < 2
+        and transition_signal
+        and (
+            (mature_to_flexible is not None and " from " not in mature_to_flexible.group(1))
+            or re.search(rf"\b{flexible}\b.{{0,40}}\bfrom\b.{{0,60}}\b{mature}\b", text) is not None
+        )
+    )
+    reversal_signal = (
+        _contains(text, _REVERSAL_TERMS)
+        or (destination_is_more_potent and transition_signal)
+        or generic_return
+        or nuclear_success
+    )
+    supports_no_return = reversal_signal and _contains(text, _NO_REVERSAL_TERMS)
+    reversal = reversal_signal and not supports_no_return
+    to_source = reversal and (
+        destination_is_more_potent
+        and destination.potency_level <= 1
+        or _contains(
+            text,
+            (
+                "pluripotent",
+                "pluripotency",
+                "source state",
+                "sourcestate",
+                "stem like",
+                "stem cell like",
+                "embryonic like",
+                "embryonic state",
+                "ipsc",
+                "ips cell",
+            ),
+        )
+        or nuclear_success
+    )
+    normal_differentiation = (
+        not reversal
+        and _contains(
+            text,
+            (
+                "differentiat",
+                "downstream state",
+                "produced downstream",
+                "somatic lineage",
+                "lineage restriction",
+                "progressive restriction",
+            ),
+        )
+    )
+    failed = _contains(text, _FAILED_TERMS)
+
+    axis = _ood_axis(text, view)
+    regime = None
+    if axis is None and _is_lateral_conversion(text, mentions):
+        domain = view.domain()
+        excluded = tuple(domain.regimes_not_modeled) if domain is not None else ()
+        regime = _domain_value(excluded, ("lateral", "conversion"), "lateral_somatic_conversion")
+    elif axis is None and _identity_preserved(text) and _contains(
+        text,
+        ("quiescent", "dormant", "activated state", "state change", "phenotypic state"),
+    ):
+        domain = view.domain()
+        excluded = tuple(domain.regimes_not_modeled) if domain is not None else ()
+        regime = _domain_value(excluded, ("identity preserving",), "identity_preserving_state_change")
+
+    return Event(
+        text=text,
+        mentions=mentions,
+        reversal=reversal,
+        supports_no_return=supports_no_return,
+        to_source=to_source,
+        normal_differentiation=normal_differentiation,
+        failed_replication=failed,
+        ood_axis=axis,
+        ood_regime=regime,
+    )
+
+
+def _claims(view: GraphView) -> list[Claim]:
+    """Copy every currently available claim from the read-only graph view."""
+    return [claim for cid in view.list_claim_ids() if (claim := view.get_claim(cid)) is not None]
+
+
+def _claim_kind(claim: Claim) -> str:
+    """Classify a claim into the semantic vocabulary used for routing."""
+    statement = _normalized(claim.statement)
+    if claim.scope.get("mechanism_class"):
+        return "scoped_no_return"
+    if _contains(statement, ("cannot return", "cannot revert", "return to pluripotency")):
+        return "no_return"
+    if "do not increase potency" in statement or "monotonically" in statement:
+        return "potency_monotonic"
+    if _contains(statement, ("no direct transition", "distinct terminal", "distinct leaf")):
+        return "no_lateral"
+    if "nuclear developmental potential" in statement:
+        return "nuclear_potential"
+    if "differentiate into" in statement or "differentiate into somatic" in statement:
+        return "differentiation"
+    if "progressive lineage restriction" in statement:
+        return "lineage_restriction"
+    return "other"
+
+
+def _first_kind(claims: list[Claim], *kinds: str) -> Claim | None:
+    """Return the first claim whose semantic kind is requested."""
+    return next((claim for claim in claims if _claim_kind(claim) in kinds), None)
+
+
+def _scoped_claim(claims: list[Claim], mechanism: str) -> Claim | None:
+    """Find the mechanism-specific claim corresponding to a normalized method."""
+    aliases = {
+        "defined_factor": {"defined_factor", "defined_factor_expression"},
+        "env_stress": {"env_stress", "environmental_stress"},
+        "oocyte_nt": {"oocyte_nt", "nuclear_transfer", "somatic_cell_nuclear_transfer"},
+        "spontaneous": {"spontaneous"},
+    }
+    accepted = aliases.get(mechanism, {mechanism})
+    for claim in claims:
+        scope = _normalized(claim.scope.get("mechanism_class"))
+        if scope in accepted:
+            return claim
+    return None
+
+
+def _targets(event: Event, quality: EvidenceQuality, claims: list[Claim]) -> list[tuple[Claim, int, str]]:
+    """Return (claim, direction, reason), where direction is support (+1) or contradiction (-1)."""
+    targets: list[tuple[Claim, int, str]] = []
+
+    if event.failed_replication:
+        if event.ood_axis is not None or event.ood_regime is not None or not event.to_source:
+            return targets
+        target = _scoped_claim(claims, quality.mechanism)
+        if target is not None:
+            targets.append((target, +1, "failed replication supports the scoped prior"))
+        return targets
+
+    if event.supports_no_return:
+        target = _scoped_claim(claims, quality.mechanism)
+        target = target or _first_kind(claims, "no_return", "potency_monotonic")
+        if target is not None:
+            targets.append((target, +1, "well-grounded null result supports the prior"))
+        return targets
+
+    if event.reversal:
+        if event.to_source:
+            target = _scoped_claim(claims, quality.mechanism)
+            target = target or _first_kind(claims, "no_return", "potency_monotonic")
+        else:
+            target = _first_kind(claims, "potency_monotonic", "no_return")
+        if target is not None:
+            targets.append((target, -1, "observed potency reversal contradicts the claim"))
+
+        # Successful nuclear transfer also bears directly on retained nuclear
+        # potential; it is distinct from the mechanism-specific prohibition.
+        if quality.mechanism == "oocyte_nt" and event.to_source:
+            nuclear = _first_kind(claims, "nuclear_potential")
+            if nuclear is not None and (target is None or nuclear.id != target.id):
+                targets.append((nuclear, +1, "nuclear transfer supports retained potential"))
+        return targets
+
+    text = event.text
+    nuclear = _first_kind(claims, "nuclear_potential")
+    if nuclear is not None and _contains(text, ("full nuclear potential", "nuclear developmental potential", "supported development")):
+        direction = -1 if _contains(text, ("did not retain", "lost", "failed", "could not")) else +1
+        targets.append((nuclear, direction, "direct evidence about nuclear potential"))
+        return targets
+
+    if event.normal_differentiation:
+        differentiation = _first_kind(claims, "differentiation")
+        if differentiation is not None:
+            targets.append((differentiation, +1, "normal differentiation supports the claim"))
+        if _contains(text, ("lineage restriction", "progressive restriction")):
+            restriction = _first_kind(claims, "lineage_restriction")
+            if restriction is not None:
+                targets.append((restriction, +1, "progressive restriction supports the claim"))
+    return targets
+
+
+def _pending_id(mechanism: str, claim_id: str) -> str:
+    """Build a deterministic pending identifier for later resolution."""
+    return f"pending__{_slug(mechanism)}__{_slug(claim_id)}"
+
+
+def _matching_pending(
+    view: GraphView,
+    quality: EvidenceQuality,
+    targets: list[tuple[Claim, int, str]],
+    allow_only_pending: bool,
+) -> list[str]:
+    """Find only pending items this item can legitimately resolve.
+
+    A retraction or an independent failed replication almost always arrives from
+    a different group and method than the original report, so ``method_class`` is
+    not a reliable key. Resolution is matched first to the *claim* the pending
+    item was raised against, then to the original mechanism, and only as a last
+    resort to a single outstanding item.
+    """
+    pending = view.pending_ids()
+    if not pending:
+        return []
+
+    # Primary: match by the claim the pending item concerns, regardless of the
+    # method that produced this retracting or failed-replication result.
+    if targets:
+        claim_suffixes = {f"__{_slug(claim.id)}" for claim, _, _ in targets}
+        by_claim = [pid for pid in pending if any(pid.casefold().endswith(suffix) for suffix in claim_suffixes)]
+        if by_claim:
+            return by_claim
+
+    # Secondary: the same mechanism as the original report (rare, unambiguous).
+    mechanism = f"pending__{_slug(quality.mechanism)}__"
+    by_mechanism = [pid for pid in pending if pid.casefold().startswith(mechanism)]
+    if by_mechanism:
+        return by_mechanism
+
+    # Last resort: a retraction that names no phenomenon can safely resolve the
+    # only outstanding pending item, but never guess among unrelated ones.
+    if allow_only_pending and len(pending) == 1:
+        return pending
+    return []
+
+
+def _revised_confidence(claim: Claim, direction: int, quality: EvidenceQuality) -> float:
+    """Compute a bounded log-odds update from direction and evidence strength."""
+    if direction < 0:
+        # Contradictions need enough leverage to overcome strong priors, while
+        # remaining below the API's 3-log-odds per-item safety cap.
+        shift = min(2.8, max(0.0, 5.0 * (quality.score - 0.45)))
+        effect_factor = 0.55 + 0.45 * quality.effect if quality.effect_reported else 0.85
+        shift *= effect_factor
+    elif claim.confidence < 0.70 and quality.strong:
+        # Strong direct support can materially move a genuinely contested claim.
+        shift = 0.65 + 0.75 * quality.score
+    else:
+        # Confirmations nudge rather than ratchet established beliefs to certainty.
+        shift = 0.15 + 0.30 * quality.score
+    return sigmoid(logit(claim.confidence) + direction * shift)
+
+
+def _no_change(item: EvidenceItem, rationale: str, confidence: float = 0.6) -> IngestResult:
+    """Return the explicit attributed no-op used for safe rejection or saturation."""
+    return IngestResult([no_op(item.id)], rationale, confidence, False)
 
 
 def ingest(item: EvidenceItem, view: GraphView) -> IngestResult:
-    # ---- starter: does nothing. Replace with your reasoning. ----
-    #
-    # Example of proposing a change (only through a Delta, never by writing to view):
-    #   claim = view.get_claim("C3c")
-    #   if claim is not None:
-    #       return IngestResult(
-    #           deltas=[Delta("revise_confidence", item.id,
-    #                         {"claim_id": "C3c", "new_confidence": 0.4})],
-    #           rationale="strong, replicated contradiction",
-    #           confidence=0.8, ood_flag=False)
-    #
-    return IngestResult(deltas=[no_op(item.id)], rationale="starter no-op", confidence=0.5, ood_flag=False)
+    """Classify one item and return a bounded, attributed decision.
+
+    The order is intentional: validate the body, score trusted provenance,
+    resolve invalidated pending evidence, detect OOD cases, then revise claims.
+    No branch writes to ``view``; all state changes are typed deltas.
+    """
+    if not isinstance(item.body, str) or len(item.body) > 20_000:
+        return _no_change(item, "malformed or oversized evidence body rejected", 0.99)
+    if _looks_like_instruction(item.body):
+        return _no_change(item, "instruction-like content rejected by the firewall", 0.99)
+
+    body = item.body if isinstance(item.body, str) else ""
+    event = _event(item, body, view)
+    quality = _quality(item, event.text)
+    claims = _claims(view)
+    targets = _targets(event, quality, claims)
+
+    # Trusted invalidation metadata outranks every interpretation of the prose.
+    # In particular, a retracted lateral-conversion claim must not create an OOD
+    # proposal merely because its body still describes the original claim.
+    pending = _matching_pending(
+        view,
+        quality,
+        targets,
+        allow_only_pending=(quality.retracted or event.failed_replication)
+        and event.ood_axis is None
+        and event.ood_regime is None,
+    )
+    if quality.retracted or event.failed_replication:
+        if pending:
+            return IngestResult(
+                [Delta("drop_claim", item.id, {"claim_id": pid}) for pid in pending],
+                "retraction or failed replication resolved only the matching pending claim",
+                0.95 if quality.retracted else max(0.7, quality.score),
+                False,
+            )
+        if quality.retracted:
+            return _no_change(item, "retracted evidence has no matching pending dependency", 0.95)
+        # With no pending dependency, a strong failure may mildly support a
+        # scoped prior. It never establishes the failed phenomenon as OOD.
+        if not quality.credible or not targets:
+            return _no_change(item, "no matching pending claim to resolve", 0.85)
+
+    if quality.explicit_null_effect and not (event.supports_no_return or event.failed_replication):
+        return _no_change(item, "structured provenance reports no observed effect", 0.9)
+
+    # OOD is decided before contradiction: a lateral endpoint conversion or an
+    # unmodeled property must not refute a claim that was scoped to another regime.
+    if event.ood_axis is not None and not event.failed_replication:
+        deltas = []
+        if quality.credible:
+            deltas.append(Delta("propose_axis", item.id, {"axis": event.ood_axis}))
+        if not deltas:
+            deltas.append(no_op(item.id))
+        return IngestResult(
+            deltas,
+            "evidence concerns an unmodeled property axis",
+            max(0.6, quality.score),
+            True,
+        )
+
+    if event.ood_regime is not None and not event.failed_replication:
+        deltas = []
+        if quality.credible:
+            deltas.append(Delta("propose_regime", item.id, {"regime": event.ood_regime}))
+        if not deltas:
+            deltas.append(no_op(item.id))
+        return IngestResult(
+            deltas,
+            "direct cross-lineage endpoint conversion is outside the modeled regime",
+            max(0.6, quality.score),
+            True,
+        )
+
+    contradictions = [target for target in targets if target[1] < 0]
+    if contradictions and (quality.thin or not quality.credible):
+        claim = contradictions[0][0]
+        pending_id = _pending_id(quality.mechanism, claim.id)
+        return IngestResult(
+            [
+                Delta(
+                    "hold_pending",
+                    item.id,
+                    {
+                        "claim_id": pending_id,
+                        "note": f"Unreplicated contradiction via {quality.mechanism}; awaiting independent confirmation.",
+                    },
+                )
+            ],
+            "extraordinary contradiction has insufficient independent provenance",
+            max(0.55, 1.0 - quality.score),
+            False,
+        )
+
+    if not targets or not quality.credible:
+        return _no_change(item, "no sufficiently grounded in-model revision", max(0.5, quality.score))
+
+    deltas: list[Delta] = []
+    reasons: list[str] = []
+    for claim, direction, reason in targets:
+        new_confidence = _revised_confidence(claim, direction, quality)
+        # Avoid meaningless writes near probability saturation.
+        if abs(new_confidence - claim.confidence) < 0.001:
+            continue
+        deltas.append(
+            Delta(
+                "revise_confidence",
+                item.id,
+                {"claim_id": claim.id, "new_confidence": round(new_confidence, 6)},
+            )
+        )
+        reasons.append(reason)
+        if direction < 0 and quality.strong and quality.mechanism != "unspecified":
+            deltas.append(
+                Delta(
+                    "set_scope",
+                    item.id,
+                    {
+                        "claim_id": claim.id,
+                        "scope": {
+                            "exception_under": quality.mechanism,
+                            f"exception_under_{_slug(quality.mechanism)}": True,
+                        },
+                    },
+                )
+            )
+
+    if not deltas:
+        return _no_change(item, "evidence agrees with an already saturated belief", quality.score)
+
+    return IngestResult(
+        deltas,
+        "; ".join(reasons),
+        min(0.98, max(0.65, quality.score)),
+        False,
+    )

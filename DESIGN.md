@@ -1,109 +1,114 @@
-# GROUND TRUTH design
+# GROUND TRUTH semantic-policy design
 
-## What was added
+## Security boundary
 
-`starter/my_solution.py` now contains a deterministic online belief-revision
-policy. `ingest` never writes to `GraphView`; the only state changes it can cause
-are attributed, closed-vocabulary `Delta` objects. `item.tag` and all external
-state are ignored. This implementation is deliberately rule-based and uses only
-the Python standard library.
+`starter/my_solution.py` is a small entrypoint. The policy lives in
+`starter/semantic_policy.py` and returns only attributed, closed-vocabulary
+`Delta` objects; it never writes through `GraphView`.
 
-## Trust boundary and decision order
+The evidence body is untrusted. It may propose a clause-local scientific event,
+but it cannot directly name an operation, claim ID, confidence, scope field, or
+evidence weight. Structured provenance is syntactically privileged for scoring,
+but it is **not authenticated by this challenge interface**. A real deployment
+must verify the issuer and a signature binding the provenance to the complete
+typed event before calling this policy.
 
-The evidence body is an untrusted description. It is used only to route the item
-to graph states, claims, transitions, or property axes. It never supplies
-replication counts, authority, confidence values, claim IDs, or executable
-instructions. Structured `item.provenance` is the trusted evidence channel;
-`view` is read-only graph context.
+The implementation is deterministic and standard-library-only. It is not
+keyword-free: semantic frames and the small direct-control gate still use
+lexical patterns. The important improvement is that a matched word is not itself
+an authorization. A complete typed event and valid structured provenance must
+pass separate admission checks before deterministic code can choose a delta.
 
-Because update *magnitude* is derived only from structured provenance and never
-from the body, a mutation driven by injected text is impossible by construction:
-no field an attacker controls feeds a `Delta` payload. The instruction detector in
-step 1 is defense-in-depth that keeps injection items as clean no-ops; the firewall
-itself does not depend on it.
+## Decision pipeline
 
-Every item follows this order:
+1. Normalize Unicode, remove formatting controls, reject oversized input, and
+   fail closed on unbalanced quotation or brackets.
+2. Detect only composite control-plane patterns, such as a role plus directive,
+   an override plus protected channel, or an output objective plus claim target.
+   Individual words such as `system`, `model`, `direct`, and `confidence` are not
+   direct firewall triggers.
+3. Split the body into clauses and classify their speech acts. Questions,
+   hypotheses, quotations, reported allegations, and writing/processing
+   instructions are not observations. If any clause is instruction-shaped, the
+   whole evidence item abstains so a second factual-looking clause cannot be used
+   to launder the command.
+4. Extract a closed `SemanticEvent`: proposition, polarity, source,
+   destination, property axis, and OOD regime. Transition updates normally
+   require explicit graph roles; narrow directional phrases cover the official
+   within-lineage case. Conflicting or unrelated multiple events abstain.
+5. Parse provenance with anchored grammars and exact enums. Counts must be
+   nonnegative integers. Unknown values or malformed types return `no_op`; they
+   cannot create, revise, or delete graph state.
+6. Map the admitted event to a finite graph claim using deterministic code.
+   Body prose never supplies a claim ID, target confidence, or delta operation.
+7. Use bounded log-odds changes derived from structured quality. Thin
+   contradictions become origin-distinct pending records; sufficiently grounded
+   contradictions revise confidence and may add a mechanism-scoped exception.
 
-1. Reject a missing, oversized, or instruction-like body with an attributed
-   no-op. The detector covers processor/system prompts, provenance overrides,
-   API/delta names, imperative graph edits, and claim-confidence assignments.
-2. Normalize prose and resolve CamelCase, plural, acronym, and common natural
-   language state names through `GraphView`.
-3. Convert provenance to a bounded quality score:
-   `0.40*groups + 0.15*replication + 0.20*directness + 0.15*effect +
-   0.10*method_reliability`. Count values saturate at 1, 2, 3, and 4+ sources.
-   Evidence is credible only when score ≥ 0.60 and at least two independent
-   groups are present; it is strong at score ≥ 0.82 and at least three groups.
-   One group plus one replication is always thin, regardless of prose claims.
-4. Resolve trusted retractions or failed replications before interpreting the
-   original phenomenon. Only a matching pending item is dropped. An explicit
-   structured null effect vetoes a positive body claim.
-5. Detect OOD evidence. A conversion between two equal-potency, cross-lineage
-   states proposes the declared lateral-conversion regime (recognized from
-   explicit no-intermediate wording or from the state geometry itself).
-   Identity-preserving changes in age, function, chromatin, transcriptional,
-   metabolic, or morphology axes propose an axis. These cases do not revise
-   unrelated beliefs. Failed or retracted evidence cannot create an OOD proposal.
-6. Route in-model evidence to mechanism-scoped or general claims. Strong
-   contradictions revise confidence down and add a method-based scope exception;
-   confirmations use a smaller upward step. Confidence changes use log-odds,
-   remain below the API’s three-log-odds cap, and skip meaningless saturated
-   writes.
+## Auditable evidence classes
 
-## Out-of-distribution taxonomy
+Each return path receives a typed `EvidenceClass` after the semantic and
+provenance gates have made their decision. The closed taxonomy distinguishes
+control-plane injection, invalid input, non-evidence, null results, trusted
+invalidation, weak evidence, contradiction, confirmation, OOD evidence, and
+saturation. The class is appended to the rationale so decisions can be counted
+and audited without introducing another graph-mutation channel.
 
-Three cases are separated *before* any contradiction is considered, because a
-result that is outside the model must not be scored against a claim it was never
-in scope for.
+This adopts the combined branch's useful classifier idea, but not its classifier
+implementation: a class describes the decision that the stricter policy already
+made; it cannot authorize a claim target or compensate for malformed provenance.
 
-- **In-model contradiction** — a phenomenon the graph represents (a potency
-  reversal, a nuclear-transfer result). It revises the targeted claim; it is not
-  flagged.
-- **Out-of-model regime** — a conversion between two states at the *same* potency
-  but *different* lineages. That is geometrically neither a potency step nor an
-  adjacency, so the graph cannot express it; we `propose_regime` and do not refute
-  the adjacency claim. This is recognized either from explicit "direct / no
-  intermediate" wording or, structurally, from the equal-potency cross-lineage
-  geometry of the two mentioned states, so unseen phrasing is still caught.
-- **Out-of-model axis** — a property the graph does not track (age, function,
-  chromatin, morphology) changing while identity is held fixed. We `propose_axis`.
+## Pending evidence and invalidation
 
-Precision is protected by the *identity-preserved* and equal-potency guards: the
-near-miss case, a within-lineage move along the potency axis, changes potency and
-keeps its lineage, so it fails both OOD tests and is correctly revised in-model
-rather than flagged. A named intermediate suppresses the regime flag, since it
-signals an in-model potency contradiction instead.
+Pending IDs have the form:
 
-## Calibration
+```text
+pending__v2__<semantic fingerprint>__<origin fingerprint>
+```
 
-Updates are applied in log-odds, which is bounded, symmetric, and keeps each step
-below the API's three-log-odds cap. The magnitude is a function of the structured
-quality score alone, so the trajectory has the intended shape: a single weak or
-single-group result moves nothing (an update requires score ≥ 0.60 and at least
-two independent groups); a confirming result of an established belief nudges it up
-slightly; a strong, replicated contradiction (score ≥ 0.82, ≥ 3 groups) moves the
-targeted belief a lot *and* adds a mechanism-scoped exception, so the belief is
-narrowed rather than deleted. Contradictions are also scaled by reported effect
-strength; confirmations of a genuinely contested claim (confidence < 0.70) are
-allowed a larger step than confirmations of a near-saturated one.
+The semantic fingerprint binds mechanism, target claim, proposition, source,
+destination, and property axis. The origin fingerprint prevents two reports of
+the same phenomenon from overwriting one another.
 
-## Skepticism and pending evidence
+Validation occurs before invalidation. A malformed “failed to replicate” item
+cannot delete pending evidence. A valid retraction may clear one exact-semantic
+pending report, but it abstains if several origins match because the current
+input schema has no `retracts_evidence_id`. Strong confirmation may clear all
+same-event pending reports because it confirms the phenomenon rather than
+claiming to identify one retracted origin.
 
-An extraordinary contradiction with one source is held under a stable identifier
-such as `pending__env_stress__C3d`, without changing the claim. Resolution is
-matched *by the claim the pending item concerns*, not by method class, since an
-independent failed replication or retraction usually arrives from a different
-group and method than the original report; it falls back to the original mechanism
-and then, only if a single item is outstanding, to that item — it never guesses
-among several. Strong defined-factor, nuclear-transfer, and environmental evidence
-is routed to the corresponding scoped claim; successful nuclear transfer also
-supports retained nuclear potential.
+## Out-of-distribution behavior
+
+- A direct equal-potency, cross-lineage endpoint conversion proposes the
+  `lateral_somatic_conversion` regime.
+- An identity-preserving change to an unmodeled property proposes the relevant
+  axis or regime.
+- A within-lineage potency reversal stays in-model and revises a represented
+  claim rather than being labelled OOD.
+- Questions, commands, examples, and writing requests are not scientific OOD;
+  they are simply inadmissible evidence.
+
+## Hard limits
+
+This policy cannot prove scientific truth from prose and metadata supplied by
+the same untrusted party. It also cannot guarantee recall for every synonym or
+novel grammatical construction. A production design should add:
+
+- signatures over issuer, study ID, typed event fields, raw-artifact hash,
+  provenance, timestamp, and explicit retraction linkage;
+- independent study identities instead of self-reported counts;
+- an LLM or scientific NLI model only as an untrusted extractor, using a closed
+  schema and abstention on parser/verifier disagreement;
+- source-span retention, external evidence retrieval, and dependency-aware
+  rollback for already-applied revisions.
+
+Passing the repository's tests demonstrates containment on the tested threat
+model. It is not a proof of prompt-injection security or factual truth.
 
 ## Verification
 
-The public sandbox passes with the firewall gate clear and `tp=1, fp=0, fn=0` for
-OOD detection. Additional tests cover injection variants, spoofed provenance,
-mechanism-specific updates, nuclear-transfer phrasing, weak pending evidence,
-retraction cleanup, null effects, malformed input, and unseen OOD wording. A
-deterministic fuzz run of 750 JSON-shaped inputs produced no crashes, rejected
-deltas, structural violations, or nondeterministic results.
+```powershell
+python public_scorer.py starter/my_solution.py
+python adversarial/run_adversarial.py starter/my_solution.py
+python adversarial/metamorphic_checks.py starter/my_solution.py
+```

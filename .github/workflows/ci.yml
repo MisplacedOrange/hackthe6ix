@@ -1,0 +1,44 @@
+name: deterministic-firewall-ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  core-and-ui:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      EPISTEMICOS_PROVIDER_MODE: fake
+      GEMINI_API_KEY: ""
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.11.16"
+
+      - name: Sync locked Python environment
+        working-directory: epistemicos
+        run: uv sync --locked --dev
+
+      - name: Run provider-free security suite
+        working-directory: epistemicos
+        run: uv run pytest -q
+
+      - name: Install locked UI dependencies
+        working-directory: epistemicos/ui
+        run: npm ci
+
+      - name: Lint UI
+        working-directory: epistemicos/ui
+        run: npm run lint
+
+      - name: Build UI
+        working-directory: epistemicos/ui
+        run: npm run build

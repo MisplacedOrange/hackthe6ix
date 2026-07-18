@@ -1,0 +1,47 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+.env.*
+!.env.example
+*.local
+
+# Credentials and private keys
+*.pem
+*.key
+*.crt
+*.cer
+*.p12
+*.pfx
+credentials.json
+secrets.json
+secrets/
+credentials/
+
+# Local databases, logs, and test output
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.log
+*.bak
+*.tmp
+
+# Internal project documents
+EVIDENCE_FIREWALL_V2.md
+epistemicos/REDTEAM_REPORT.md
+epistemicos/TEST_REPORT.md
+epistemicos/DEMO_RUNBOOK.md
+
+# Dependencies and generated output
+node_modules/
+dist/
+.pytest_cache/
+.coverage
+coverage.xml
+
+# Local tooling and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

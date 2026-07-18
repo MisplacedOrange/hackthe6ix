@@ -3,6 +3,23 @@
 The prose body is used only to identify what an experiment is about.  Whether
 that experiment is allowed to change the graph, and by how much, is decided from
 the structured provenance channel.  All writes are returned as typed deltas.
+
+Research inspirations used by this implementation:
+
+* Wilie et al., "Belief Revision: The Adaptability of Large Language Models
+  Reasoning," arXiv:2406.19764.  We use its delta-reasoning distinction between
+  evidence that warrants revision and evidence that should leave beliefs alone.
+* Wallace et al., "The Instruction Hierarchy," arXiv:2404.13208.  We enforce an
+  explicit privilege boundary: evidence prose is untrusted, while the harness's
+  structured provenance and typed delta contract are privileged channels.
+* Ni et al., "Towards Trustworthy Knowledge Graph Reasoning," arXiv:2410.08985,
+  and Lee, "Decomposing Uncertainty in Probabilistic Knowledge Graph
+  Embeddings," arXiv:2512.22318.  We abstain under insufficient evidence and
+  separate unmodeled property axes from unmodeled relational regimes.
+
+These papers motivate the architecture; the concrete thresholds and bounded
+log-odds policy below are challenge-specific choices, not claimed reproductions
+of the papers' experimental methods.
 """
 from __future__ import annotations
 
@@ -143,6 +160,14 @@ class Event:
     ood_regime: str | None
 
 
+@dataclass(frozen=True)
+class OODAssessment:
+    """Decompose domain mismatch into property-axis and relation-regime novelty."""
+
+    axis: str | None
+    regime: str | None
+
+
 def _normalized(value: Any) -> str:
     """Normalize prose while also removing common invisible obfuscation."""
     if not isinstance(value, str):
@@ -163,6 +188,12 @@ def _contains(text: str, phrases: Iterable[str]) -> bool:
     return any(phrase in text for phrase in phrases)
 
 
+# =============================================================================
+# INSPIRATION FROM ARXIV: "The Instruction Hierarchy" (arXiv:2404.13208)
+# Lower-privilege evidence prose may describe an experiment, but it may never
+# issue graph commands or override higher-privilege provenance/policy.  This is
+# implemented as both injection rejection and a copied trusted-channel accessor.
+# =============================================================================
 def _looks_like_instruction(body: Any) -> bool:
     """Fail closed on text that tries to address or control the processor."""
     text = _normalized(body).replace("_", " ").replace("-", " ")
@@ -218,6 +249,12 @@ def _looks_like_instruction(body: Any) -> bool:
     return False
 
 
+def _trusted_provenance(item: EvidenceItem) -> dict[str, Any]:
+    """Return an isolated copy of the only channel authorized to add weight."""
+    provenance = item.provenance
+    return dict(provenance) if isinstance(provenance, dict) else {}
+
+
 def _number(value: Any) -> float:
     """Parse bounded count metadata; malformed values contribute no weight."""
     if isinstance(value, bool):
@@ -270,7 +307,7 @@ def _mechanism(method_class: str, body: str) -> str:
 
 def _quality(item: EvidenceItem, body: str) -> EvidenceQuality:
     """Score structured provenance without trusting claims made in the body."""
-    provenance = item.provenance if isinstance(item.provenance, dict) else {}
+    provenance = _trusted_provenance(item)
     groups = _number(provenance.get("independent_groups"))
     replications = _number(provenance.get("replication_count"))
 
@@ -422,6 +459,15 @@ def _identity_preserved(text: str) -> bool:
     )
 
 
+# =============================================================================
+# INSPIRATION FROM ARXIV:
+# - "Towards Trustworthy Knowledge Graph Reasoning" (arXiv:2410.08985)
+# - "Decomposing Uncertainty in Probabilistic Knowledge Graph Embeddings"
+#   (arXiv:2512.22318)
+# We do not equate surprise with OOD.  We decompose novelty into an unmodeled
+# property axis and an unmodeled relation/regime; familiar entities undergoing
+# a modeled potency reversal remain an in-model contradiction.
+# =============================================================================
 def _ood_axis(text: str, view: GraphView) -> str | None:
     """Return an excluded property axis when the evidence studies one."""
     domain = view.domain()
@@ -546,6 +592,40 @@ def _is_lateral_conversion(text: str, mentions: tuple[StateMention, ...]) -> boo
     return False
 
 
+def _assess_ood(
+    text: str,
+    mentions: tuple[StateMention, ...],
+    view: GraphView,
+) -> OODAssessment:
+    """Classify domain mismatch without confusing a rare event with OOD."""
+    axis = _ood_axis(text, view)
+    if axis is not None:
+        return OODAssessment(axis=axis, regime=None)
+
+    domain = view.domain()
+    excluded_regimes = tuple(domain.regimes_not_modeled) if domain is not None else ()
+    if _is_lateral_conversion(text, mentions):
+        regime = _domain_value(
+            excluded_regimes,
+            ("lateral", "conversion"),
+            "lateral_somatic_conversion",
+        )
+        return OODAssessment(axis=None, regime=regime)
+
+    if _identity_preserved(text) and _contains(
+        text,
+        ("quiescent", "dormant", "activated state", "state change", "phenotypic state"),
+    ):
+        regime = _domain_value(
+            excluded_regimes,
+            ("identity preserving",),
+            "identity_preserving_state_change",
+        )
+        return OODAssessment(axis=None, regime=regime)
+
+    return OODAssessment(axis=None, regime=None)
+
+
 def _event(item: EvidenceItem, body: str, view: GraphView) -> Event:
     """Extract a conservative, graph-aware description of the reported event."""
     text = _normalized(body).replace("-", " ")
@@ -557,7 +637,7 @@ def _event(item: EvidenceItem, body: str, view: GraphView) -> Event:
         and destination is not None
         and destination.potency_level < source.potency_level
     )
-    provenance = item.provenance if isinstance(item.provenance, dict) else {}
+    provenance = _trusted_provenance(item)
     method_class = _normalized(provenance.get("method_class"))
     nuclear_method = any(term in method_class for term in ("nuclear", "oocyte", "scnt", "cloning"))
     nuclear_success = (
@@ -641,19 +721,7 @@ def _event(item: EvidenceItem, body: str, view: GraphView) -> Event:
     )
     failed = _contains(text, _FAILED_TERMS)
 
-    axis = _ood_axis(text, view)
-    regime = None
-    if axis is None and _is_lateral_conversion(text, mentions):
-        domain = view.domain()
-        excluded = tuple(domain.regimes_not_modeled) if domain is not None else ()
-        regime = _domain_value(excluded, ("lateral", "conversion"), "lateral_somatic_conversion")
-    elif axis is None and _identity_preserved(text) and _contains(
-        text,
-        ("quiescent", "dormant", "activated state", "state change", "phenotypic state"),
-    ):
-        domain = view.domain()
-        excluded = tuple(domain.regimes_not_modeled) if domain is not None else ()
-        regime = _domain_value(excluded, ("identity preserving",), "identity_preserving_state_change")
+    ood = _assess_ood(text, mentions, view)
 
     return Event(
         text=text,
@@ -663,8 +731,8 @@ def _event(item: EvidenceItem, body: str, view: GraphView) -> Event:
         to_source=to_source,
         normal_differentiation=normal_differentiation,
         failed_replication=failed,
-        ood_axis=axis,
-        ood_regime=regime,
+        ood_axis=ood.axis,
+        ood_regime=ood.regime,
     )
 
 
@@ -812,6 +880,13 @@ def _matching_pending(
     return []
 
 
+# =============================================================================
+# INSPIRATION FROM ARXIV: "Belief Revision: The Adaptability of Large Language
+# Models Reasoning" (arXiv:2406.19764)
+# Its delta-reasoning framing motivates an explicit choice among revision,
+# abstention/pending, and no change.  Our challenge-specific numerical policy
+# applies bounded evidence shifts in log-odds space to avoid anchoring and flips.
+# =============================================================================
 def _revised_confidence(claim: Claim, direction: int, quality: EvidenceQuality) -> float:
     """Compute a bounded log-odds update from direction and evidence strength."""
     if direction < 0:

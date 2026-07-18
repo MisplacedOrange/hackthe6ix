@@ -1358,5 +1358,3 @@ def ingest(item: EvidenceItem, view: GraphView) -> IngestResult:
         min(0.98, max(0.65, quality.score)),
         False,
     )
-
-    ##CONT.    

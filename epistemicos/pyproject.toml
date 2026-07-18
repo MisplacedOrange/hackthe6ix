@@ -1,0 +1,30 @@
+[project]
+name = "epistemicos"
+version = "0.1.0"
+description = "The Evidence Firewall - an epistemic integrity lattice for defending LLM-mediated belief systems"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi",
+    "uvicorn[standard]",
+    "sse-starlette",
+    "pydantic>=2",
+    "google-genai",
+    "networkx",
+    "numpy",
+    "python-dotenv",
+]
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "httpx",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+asyncio_mode = "auto"
+testpaths = ["tests"]

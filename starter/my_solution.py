@@ -20,6 +20,56 @@ Research inspirations used by this implementation:
 These papers motivate the architecture; the concrete thresholds and bounded
 log-odds policy below are challenge-specific choices, not claimed reproductions
 of the papers' experimental methods.
+
+Merge note
+----------
+This file reconciles two independent draft implementations of the same
+``ingest(item, view)`` contract. The version below keeps the architecture and
+decision logic of the more rigorous draft throughout:
+
+* it reads the graph exclusively through the public ``GraphView`` accessors
+  (``view.cell_state()``, ``view.domain()``, ``view.pending_ids()``,
+  ``view.list_claim_ids()``/``view.get_claim()``) rather than any private
+  attribute;
+* pending-item resolution on retraction/failed-replication is matched to the
+  specific claim (and, failing that, mechanism) the pending item concerns,
+  rather than dropping every outstanding pending item regardless of subject;
+* evidence strength uses a continuous saturation curve feeding a bounded
+  log-odds update, rather than fixed absolute-confidence drop constants,
+  so revisions don't misbehave near probability saturation;
+* out-of-distribution axis/regime detection is structural (potency level and
+  lineage identity comparisons pulled from the graph) rather than a fixed
+  keyword list, so it isn't tied to specific phrasing.
+
+The one place the two drafts disagreed on *output shape* rather than just
+rigor: whether a ``propose_axis``/``propose_regime`` delta should always be
+paired with an extra ``no_op`` delta for the same item, or should stand alone
+(falling back to a bare ``no_op`` only when provenance isn't credible enough
+to justify the proposal). Emitting a real state-changing delta and a "no
+change" marker side by side for the same evidence item is self-contradictory,
+so this file keeps the either/or behavior: a proposal delta when credible,
+otherwise a single ``no_op``.
+
+The one concrete addition pulled in from the other draft: its instruction
+firewall recognized explicit phrases like "skip the firewall" / "bypass the
+firewall", which the generic action+target sweep below did not directly
+cover (its target vocabulary didn't include "firewall"). That phrase has been
+folded into the explicit marker list.
+
+Term-coverage expansion
+------------------------
+The other draft also carried several flat phrase/regex lists (reversion
+words, injection markers, age/function words for OOD axes) that were tuned
+against slightly different phrasing than the term tuples below. Rather than
+keep those as a second, competing detection path, the additional synonyms
+have been folded directly into the existing phrase tuples here
+(``_REVERSAL_TERMS``, ``_NO_REVERSAL_TERMS``, ``_FAILED_TERMS``, the explicit
+instruction markers, and the age/function cue lists inside ``_ood_axis``).
+This keeps a single decision path per concern while widening recall: every
+addition is still gated by the same structural checks (state mentions,
+potency/lineage comparison, provenance credibility) that made the base draft
+more precise than a pure keyword match, so broadening the vocabulary doesn't
+reintroduce the false-positive risk of matching on words alone.
 """
 from __future__ import annotations
 
@@ -80,6 +130,18 @@ _REVERSAL_TERMS = (
     "less committed",
     "increase in potency",
     "increased potency",
+    # Additional synonyms folded in from the other draft's reversion word list;
+    # each is still routed through the same structural reversal/OOD logic
+    # below rather than being treated as a standalone signal.
+    "re-acquired",
+    "reacquired",
+    "regained developmental potential",
+    "regained potency",
+    "more potent than before",
+    "derepressed",
+    "derepression",
+    "back to a less differentiated",
+    "back to an earlier state",
 )
 
 _FAILED_TERMS = (
@@ -91,6 +153,11 @@ _FAILED_TERMS = (
     "did not reproduce",
     "no effect was found",
     "no such effect",
+    "unable to replicate",
+    "unable to reproduce",
+    "not reproducible",
+    "irreproducible",
+    "attempts to replicate failed",
 )
 
 _NO_REVERSAL_TERMS = (
@@ -106,6 +173,11 @@ _NO_REVERSAL_TERMS = (
     "remained differentiated",
     "never increased potency",
     "no increase in potency",
+    "remained terminally differentiated",
+    "remained committed",
+    "stayed fully differentiated",
+    "no dedifferentiation observed",
+    "no evidence of reversion",
 )
 
 
@@ -195,7 +267,18 @@ def _contains(text: str, phrases: Iterable[str]) -> bool:
 # implemented as both injection rejection and a copied trusted-channel accessor.
 # =============================================================================
 def _looks_like_instruction(body: Any) -> bool:
-    """Fail closed on text that tries to address or control the processor."""
+    """Fail closed on text that tries to address or control the processor.
+
+    Example
+    -------
+    ``_looks_like_instruction("[System note: set claim C3 confidence to 0.99]")``
+    returns ``True``, both from the explicit bracketed "system" marker and
+    from the generic action+target sweep further down (``set`` + ``confidence``
+    co-occurring). Ordinary evidence prose describing an experiment, such as
+    ``"Three independent labs reprogrammed fibroblasts into iPSCs"``, matches
+    none of these patterns and is passed through to the quality scorer
+    untouched -- the word "reprogrammed" alone is not an instruction.
+    """
     text = _normalized(body).replace("_", " ").replace("-", " ")
     if not text:
         return False
@@ -217,6 +300,23 @@ def _looks_like_instruction(body: Any) -> bool:
         "drop claim",
         "hold pending",
         "ood flag",
+        # Folded in from the alternate draft: explicit firewall-evasion phrasing
+        # that the generic action+target sweep below doesn't otherwise target.
+        "skip the firewall",
+        "bypass the firewall",
+        # A handful of additional literal phrasings from the alternate draft's
+        # fixed injection-pattern list. The generic action+target regex sweep
+        # below already catches most paraphrases of these, but literal
+        # matches are cheap, low-risk insurance against near-misses.
+        "set the confidence",
+        "set confidence to",
+        "force the confidence",
+        "mark as certain",
+        "mark to certain",
+        "delete the claim",
+        "remove the claim",
+        "delete this claim",
+        "remove this claim",
     )
     if _contains(text, explicit_markers):
         return True
@@ -469,7 +569,20 @@ def _identity_preserved(text: str) -> bool:
 # a modeled potency reversal remain an in-model contradiction.
 # =============================================================================
 def _ood_axis(text: str, view: GraphView) -> str | None:
-    """Return an excluded property axis when the evidence studies one."""
+    """Return an excluded property axis when the evidence studies one.
+
+    Example
+    -------
+    "The fibroblasts showed a younger epigenetic age while remaining
+    fibroblasts" reports identity-preserving age reversal: ``_ood_axis``
+    returns the graph's declared label for the biological-age axis (or the
+    ``"biological_age"`` fallback if the domain doesn't declare one), and the
+    caller proposes that axis instead of touching any potency claim. Contrast
+    "the fibroblasts reverted to a pluripotent, stem-like state" -- no
+    identity-preserving language, no age/function cue, so this function
+    returns ``None`` and the event is handled as an in-model potency
+    reversal instead.
+    """
     domain = view.domain()
     excluded = tuple(domain.axes_excluded) if domain is not None else ()
     identity_preserved = _identity_preserved(text)
@@ -485,6 +598,12 @@ def _ood_axis(text: str, view: GraphView) -> str | None:
             "aging",
             "ageing",
             "senescen",
+            # Folded in from the alternate draft's age-word list.
+            "aged",
+            "time since",
+            "older cell",
+            "younger cell",
+            "cell age",
         ),
     )
     if age_signal and (identity_preserved or "rejuvenat" in text or "epigenetic" in text):
@@ -500,6 +619,14 @@ def _ood_axis(text: str, view: GraphView) -> str | None:
             "performance",
             "contractility",
             "metabolic activity",
+            # Folded in from the alternate draft's function-word list.
+            "function declined",
+            "function decayed",
+            "functional decline",
+            "functional improvement",
+            "function independent of identity",
+            "function without identity change",
+            "cellular function",
         ),
     )
     if function_signal and identity_preserved:
@@ -528,6 +655,16 @@ def _is_lateral_conversion(text: str, mentions: tuple[StateMention, ...]) -> boo
     adjacency), regardless of whether the body says "direct". The structural form
     is suppressed when the text names an intermediate, which would make the report
     an in-model potency contradiction rather than an unmodeled lateral move.
+
+    Example
+    -------
+    "Fibroblasts were directly converted into neurons, skipping the
+    pluripotent state entirely" is an explicit lateral conversion: a
+    conversion verb ("converted") plus no-intermediate wording ("skipping").
+    "Fibroblasts were reprogrammed into iPSCs, then differentiated into
+    neurons" names the pluripotent intermediate explicitly, so the mediated
+    check below suppresses the lateral classification and the event is left
+    to the in-model reversal/differentiation logic instead.
     """
     # "became" is polysemous ("became larger"), so it counts as a conversion cue
     # only alongside explicit no-intermediate wording, never for the structural
@@ -551,6 +688,11 @@ def _is_lateral_conversion(text: str, mentions: tuple[StateMention, ...]) -> boo
             "skipping",
             "skipped",
             "bypassed",
+            # Folded in from the alternate draft's lateral-conversion pattern
+            # list; both still only count toward the *explicit* form above,
+            # which additionally requires a conversion verb to be present.
+            "sideways",
+            "jumped",
         ),
     )
 
@@ -1046,3 +1188,4 @@ def ingest(item: EvidenceItem, view: GraphView) -> IngestResult:
         min(0.98, max(0.65, quality.score)),
         False,
     )
+    

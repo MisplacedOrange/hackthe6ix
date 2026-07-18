@@ -1,0 +1,63 @@
+:root {
+  font-family: Aptos, 'Avenir Next', 'Trebuchet MS', sans-serif;
+  color: #dce8e0;
+  background: #07100b;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  --bg: #07100b;
+  --surface: #0c1610;
+  --surface-raised: #101d15;
+  --ink: #dce8e0;
+  --muted: #84948a;
+  --faint: #516057;
+  --line: #24342a;
+  --line-strong: #385143;
+  --signal: #a5ffcc;
+  --signal-dark: #173d29;
+  --warning: #f2bf73;
+  --danger: #ff735c;
+  --blue: #8db6ff;
+  --mono: 'Cascadia Mono', 'IBM Plex Mono', Consolas, monospace;
+  --serif: 'Iowan Old Style', 'Palatino Linotype', Georgia, serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+  background:
+    radial-gradient(circle at 83% 9%, rgba(53, 111, 74, 0.16), transparent 26rem),
+    linear-gradient(rgba(165, 255, 204, 0.018) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(165, 255, 204, 0.018) 1px, transparent 1px),
+    var(--bg);
+  background-size: auto, 48px 48px, 48px 48px, auto;
+}
+
+button,
+a {
+  font: inherit;
+}
+
+button:focus-visible,
+a:focus-visible {
+  outline: 2px solid var(--signal);
+  outline-offset: 3px;
+}
+
+button {
+  color: inherit;
+}
+
+::selection {
+  color: #06100a;
+  background: var(--signal);
+}

@@ -1,12 +1,25 @@
-name: selfcheck
+name: verification
 on: [push, pull_request]
 jobs:
-  practice:
+  test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.13"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
-      # the starter is a no-op, so it will report unmet practice checks but must run cleanly
-      - run: python -c "import public_scorer, groundtruth.harness, groundtruth.api; print('framework imports ok')"
+          python-version: ${{ matrix.python-version }}
+      - run: python selfcheck.py
+      - run: python public_scorer.py starter/my_solution.py
+      - run: python adversarial/run_adversarial.py starter/my_solution.py
+      - run: python adversarial/metamorphic_checks.py starter/my_solution.py
+      - run: python -m unittest discover -s tests -v
+      - run: python -m compileall -q starter reasoning_graph scientific_harness demo tests
+      - name: Verify deterministic offline demo
+        run: |
+          PYTHONHASHSEED=1 python demo/harness_demo.py --json > demo-seed-1.json
+          PYTHONHASHSEED=987654 python demo/harness_demo.py --json > demo-seed-2.json
+          cmp demo-seed-1.json demo-seed-2.json

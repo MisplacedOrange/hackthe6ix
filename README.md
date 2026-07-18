@@ -193,6 +193,8 @@ git clone https://github.com/riyabhargava11/ground-truth-challenge.git
 cd ground-truth-challenge
 python --version        # need 3.10+
 python selfcheck.py     # runs the starter against the practice sandbox
+python adversarial/run_adversarial.py starter/my_solution.py
+python -m unittest discover -s tests -v
 ```
 
 Then open `starter/my_solution.py` and implement `ingest`. Re-run `selfcheck.py`
@@ -217,7 +219,13 @@ groundtruth/              the framework you build against (do not edit)
     practice_seed.json    a small sandbox graph
     practice_stream.json  practice items (separate from the scored set)
     practice_reference.json  the public answer key for the sandbox
-starter/my_solution.py    the file you edit
+starter/my_solution.py    the scoring policy entrypoint
+starter/epistemic_core.py policy contracts, accumulation, receipts, preflight
+starter/harness_guard.py  submission-safe structural guard
+reasoning_graph/          versioned, replayable scientific judgment sidecar
+scientific_harness/       sensors, context, reviewer, rules, adapters
+demo/                     deterministic offline harness replay
+tests/                    workstream and cross-workstream regression tests
 selfcheck.py              run your solution on the practice sandbox
 public_scorer.py          the practice self-check (not the scored harness)
 WHAT_IS_TESTED.md         the detailed specification
@@ -233,10 +241,12 @@ run only at judging.
 
 ## Rules, briefly
 
-Python 3.10+; the standard library is enough. You edit only `starter/my_solution.py`
-and any helpers you import from it. Teams of 1 to 4. One submission per team: your
-filled-in solution plus a one-page `DESIGN.md` describing your evidence-weighting
-model and how you enforce the firewall. Full details in `RULES.md`.
+Python 3.10+; the standard library is enough. The scored submission remains
+`starter/my_solution.py` plus its self-contained helper. The reasoning graph and
+harness are non-scoring sidecar code and never become imports of the scored path.
+Teams of 1 to 4. One submission per team includes the one-page `DESIGN.md` and
+the regression matrix described in the implementation plan. Full challenge
+constraints remain in `RULES.md`.
 
 ---
 

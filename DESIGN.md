@@ -1,118 +1,82 @@
-# GROUND TRUTH reasoning design
+# Paladin — Design
 
-## Trust boundary
+`ingest` reads a read-only graph, treats `item.body` as untrusted text, and
+treats structured `item.provenance` as the only evidence-quality channel. Text
+may *identify* a scientific event, but it can never choose a claim ID, an
+operation, a confidence value, a scope key, provenance weight, or OOD status.
+Every decision is returned as an attributed member of the closed `Delta`
+vocabulary; the graph is never mutated directly.
 
-`starter/my_solution.py` contains the complete scored policy. `ingest` reads a
-read-only graph, treats `item.body` as untrusted text, and treats structured
-`item.provenance` as the only evidence-quality channel. It never reads
-`item.tag` or mutates the graph directly; every decision is returned as an
-attributed member of the framework's closed `Delta` vocabulary. It may, for a
-narrow, firewall-flagged minority of items, consult an optional model (see
-"Canary model review" below) — that model has no graph, provenance, or
-mutation access of its own and cannot itself change what a deterministic gate
-would otherwise decide.
+## Firewall
 
-The body is Unicode-normalized before inspection. Composite control-plane
-instructions, imperatives, questions, hypotheses, conflicting events, unknown
-states, and ambiguous endpoint roles fail closed as an attributed `no_op`.
-Text may identify a scientific event, but it cannot choose claim IDs,
-operations, confidence values, scope keys, provenance weight, or OOD status.
-Detected control-plane instructions are an absolute gate: no verdict from any
-model can ever clear that flag.
+The body is Unicode-normalized (NFKC; invisible, format, and confusable
+characters stripped) before inspection. `_direct_control_attempt` matches six
+control-plane regex families ("ignore previous instructions", "set confidence
+to…", spoofed system/grader messages, imperatives targeting claims/deltas) over
+both folded and confusable-mapped text; a clause-level speech-act classifier
+rejects imperatives and task framing. **A control-plane hit is an absolute gate:
+it fails closed to an attributed `no_op` and is never escalated to any model.**
+Structured provenance with any unrecognized field is invalid and also fails
+closed. Because untrusted text cannot express a delta and cannot supply targets,
+no persuasive document can mutate the graph.
 
-## Authorization monitor
+## Evidence weighting
 
-Whatever the policy decides passes through a final, independent reference
-monitor (`_authorize`) before it is returned. The monitor re-derives, from the
-graph and the *structured* provenance alone, exactly what each delta is allowed
-to be: `revise_confidence` must target a real claim with a finite in-range
-confidence; `set_scope` must carry only the mechanism-keyed exception derived
-from structured provenance; `drop_claim` may reference only a pending record
-that already exists in the graph; `hold_pending` must be a well-formed token
-attributed to the active item; and an OOD `propose_axis`/`propose_regime` value
-must be a property/regime the graph's own domain already declares out of model.
-Every delta must be attributed to the current item, and the operation must be
-in the closed vocabulary. Any delta that fails — a body-fabricated target, an
-out-of-range confidence, an arbitrary OOD string, a spoofed attribution — makes
-the entire result collapse to one attributed `no_op`. This is defense in depth:
-the deterministic policy already never sources these from body text, and the
-monitor guarantees that no future path can either.
+Provenance fields use bounded count grammars and closed alias maps for
+directness, effect, method class, and retraction. Counts saturate for
+diminishing returns. Accepted evidence gets a deterministic quality score:
 
-## Evidence weighting and revision
+```
+0.40·saturate(independent_groups) + 0.15·saturate(replications)
++ 0.20·directness + 0.15·effect + 0.10·method_reliability
+```
 
-Provenance fields use bounded count grammars and closed aliases for directness,
-effect strength, method class, and retraction status. Invalid metadata fails
-closed. Accepted evidence receives a deterministic score with weights of 40%
-independent groups, 15% replications, 20% directness, 15% effect, and 10% method
-reliability. Counts saturate to give diminishing returns.
+Thresholds gate action: `credible` (groups ≥ 2, score ≥ 0.60) is required to
+move a belief; `strong` (groups ≥ 3, score ≥ 0.82) unlocks scoping.
 
-Credible in-model evidence updates confidence in bounded log-odds. Strong
-contradictions move more than confirmations, while already-high confirmations
-receive only a small nudge. Strong mechanism-specific contradictions also add a
-scope exception instead of deleting the general belief.
+## Revision
 
-Thin extraordinary contradictions are held as versioned pending records. Each
-record contains only a semantic fingerprint, quantized structured provenance,
-and a hash of the trusted evidence ID. Four distinct compatible origins can
-promote a pending family; duplicate origins do not accumulate. Retractions and
-failed replications can drop only one exactly matching pending family.
+Confidence updates in bounded log-odds (`logit`/`sigmoid`, movement capped at
+3.0). Contradictions move more than confirmations; a well-powered study
+confirming a weak prior moves meaningfully; confirming an already-high prior
+only nudges. A strong, mechanism-specific contradiction emits `set_scope` — a
+mechanism-keyed exception — rather than deleting the general belief: *true in
+general, false under this condition.*
 
-## Canary model review
+## Skepticism
 
-The decision flow is: input → deterministic policy → **YES** (intake), **NO**
-(omit), or **UNSURE** → canary model → deterministic policy again → **YES**
-(intake) / **NO** (omit). "UNSURE" is a body the deterministic parser could
-not cleanly classify — unbalanced delimiters, or more than one candidate event
-— and only those items reach the sacrificial "canary" model inlined in
-`starter/my_solution.py` (`_oracle_review`). The injection gate above is a
-confident **NO**, never routed to the canary: a regex-caught control-plane
-attempt cannot be argued back in.
+Thin extraordinary contradictions are held as versioned `hold_pending` tokens
+carrying only a semantic fingerprint, quantized provenance, and a hash of the
+trusted evidence ID — never body text. Four distinct compatible origins promote a
+pending family (duplicate origins do not accumulate); a retraction or failed
+replication drops exactly one matching family. Duplicate evidence origins are
+rejected.
 
-The canary gets only the raw body and generic task instructions, never
-provenance, graph state, claim IDs, or the mutation API, and its JSON schema
-has no field for a confidence value, claim ID, or delta — only a closed
-`benign`/`injection`/`abstain` verdict plus verbatim supporting quotes. It
-proposes nothing. Its output is then re-checked by the deterministic policy:
-every quote must verify against the actual body (an ungrounded quote downgrades
-to `abstain`), and admission additionally requires the deterministic parser to
-have *independently* resolved exactly one eligible event. So the canary can
-only license a structurally-noisy-but-genuine single event onto the same intake
-pipeline every clean **YES** uses; it can never manufacture an event, and
-multi-event ("ambiguous") bodies always resolve to **NO** regardless of the
-verdict. Everything that is not admitted ends in the same `no_op` the
-deterministic policy would already return, with the verdict appended to the
-rationale for audit.
+## Out-of-distribution
 
-The canary is unavailable without `GEMINI_API_KEY`, and `GT_LLM_MODE=off`
-disables it even with a key present. Missing dependency, timeout, malformed
-JSON, or an unrecognized field all resolve to "unavailable," not a raise —
-`ingest` stays byte-identical to the deterministic policy whenever the canary
-can't be consulted. The key is read from the environment; a git-ignored `.env`
-placed next to `my_solution.py` is auto-loaded for local use, and because it is
-never committed, judging runs key-free and deterministic. See
-`starter/.env.example` for the optional local configuration surface.
+Topology is read from graph potency levels and lineage identity. A credible
+direct cross-lineage transition with no intermediate proposes the declared
+`lateral_somatic_conversion` regime; an identity-preserving change on an excluded
+property proposes that axis. Potency reversals and adjacent/same-lineage
+transitions stay in-model and revise claims. Every OOD proposal requires that the
+axis/regime already appear in the graph's own declared `axes_excluded` /
+`regimes_not_modeled` — an arbitrary body string can never become one.
 
-## Out-of-distribution handling
+## Two backstops
 
-Endpoint topology is resolved from graph cell states. A credible direct
-cross-lineage transition with no intermediate proposes the declared
-`lateral_somatic_conversion` regime. An identity-preserving change on a property
-listed in the domain's excluded axes proposes that axis. Potency reversals and
-adjacent or same-lineage transitions remain in-model and revise claims rather
-than being mislabeled OOD.
+**Canary (optional, local-only).** A body the parser cannot cleanly classify
+(unbalanced delimiters, or more than one candidate event) may be shown to a
+sacrificial model that sees *only* the raw text — no provenance, graph, IDs, or
+mutation API. It returns a closed `benign`/`injection`/`abstain` verdict with
+verbatim quotes; ungrounded quotes downgrade to `abstain`. It proposes nothing,
+and admission still requires the deterministic parser to have independently
+resolved exactly one eligible event. Without `GEMINI_API_KEY` it fails closed, so
+judging runs the pure deterministic policy.
 
-## Verification
-
-The public practice scorer, the 20-item predicted stream, direct-file loading,
-duplicate-origin handling, pending accumulation, exact pending invalidation,
-the authorization monitor, and the canary-model routing/verification/fail-closed
-behavior above are regression tested (`python -m pytest -q`). An offline
-control-canary check (`adversarial/control_canary.py`, gated in the test suite)
-runs clean scientific items and attacked variants — injected instruction,
-provenance boast, embedded claim ID, Unicode disguise, persuasive suffix —
-through the deterministic policy from the same graph snapshot and compares exact
-structured decisions; its release gate is zero unexpected mutations, and every
-attack must reproduce the clean decision or fail closed to `no_op`. The scored
-path uses only the Python standard library and the official challenge types;
-`google-genai` is an optional dependency of the canary path alone and is never
-required.
+**Authorization monitor.** Every result passes through `_authorize`, which
+re-derives from the graph and structured provenance alone what each delta may be
+(valid claim ID, in-range confidence, mechanism-keyed scope, pre-existing pending
+target, declared OOD value, attribution to the active item). Any delta it cannot
+justify collapses the whole result to one `no_op`. Defense in depth: the policy
+already never sources these from text, and the monitor guarantees no future path
+can either.

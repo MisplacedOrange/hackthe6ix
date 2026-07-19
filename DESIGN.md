@@ -20,6 +20,24 @@ operations, confidence values, scope keys, provenance weight, or OOD status.
 Detected control-plane instructions are an absolute gate: no verdict from any
 model can ever clear that flag.
 
+## Authorization monitor
+
+Whatever the policy decides passes through a final, independent reference
+monitor (`_authorize`) before it is returned. The monitor re-derives, from the
+graph and the *structured* provenance alone, exactly what each delta is allowed
+to be: `revise_confidence` must target a real claim with a finite in-range
+confidence; `set_scope` must carry only the mechanism-keyed exception derived
+from structured provenance; `drop_claim` may reference only a pending record
+that already exists in the graph; `hold_pending` must be a well-formed token
+attributed to the active item; and an OOD `propose_axis`/`propose_regime` value
+must be a property/regime the graph's own domain already declares out of model.
+Every delta must be attributed to the current item, and the operation must be
+in the closed vocabulary. Any delta that fails — a body-fabricated target, an
+out-of-range confidence, an arbitrary OOD string, a spoofed attribution — makes
+the entire result collapse to one attributed `no_op`. This is defense in depth:
+the deterministic policy already never sources these from body text, and the
+monitor guarantees that no future path can either.
+
 ## Evidence weighting and revision
 
 Provenance fields use bounded count grammars and closed aliases for directness,
@@ -72,8 +90,7 @@ JSON, or an unrecognized field all resolve to "unavailable," not a raise —
 can't be consulted. The key is read from the environment; a git-ignored `.env`
 placed next to `my_solution.py` is auto-loaded for local use, and because it is
 never committed, judging runs key-free and deterministic. See
-`LLM_SACRIFICE_IMPLEMENTATION_PLAN.md` and `.env.example` for the fuller threat
-model and configuration surface.
+`starter/.env.example` for the optional local configuration surface.
 
 ## Out-of-distribution handling
 
@@ -88,7 +105,14 @@ than being mislabeled OOD.
 
 The public practice scorer, the 20-item predicted stream, direct-file loading,
 duplicate-origin handling, pending accumulation, exact pending invalidation,
-and the canary-model routing/verification/fail-closed behavior above are
-regression tested (`python -m pytest -q`). The scored path uses only the
-Python standard library and the official challenge types; `google-genai` is
-an optional dependency of the canary path alone and is never required.
+the authorization monitor, and the canary-model routing/verification/fail-closed
+behavior above are regression tested (`python -m pytest -q`). An offline
+control-canary check (`adversarial/control_canary.py`, gated in the test suite)
+runs clean scientific items and attacked variants — injected instruction,
+provenance boast, embedded claim ID, Unicode disguise, persuasive suffix —
+through the deterministic policy from the same graph snapshot and compares exact
+structured decisions; its release gate is zero unexpected mutations, and every
+attack must reproduce the clean decision or fail closed to `no_op`. The scored
+path uses only the Python standard library and the official challenge types;
+`google-genai` is an optional dependency of the canary path alone and is never
+required.

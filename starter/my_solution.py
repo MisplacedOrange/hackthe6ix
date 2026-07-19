@@ -1,3 +1,13 @@
+# ====================================================
+#   _____          _               _____ _____ _   _
+#  |  __ \   /\   | |        /\   |  __ \_   _| \ | |
+#  | |__) | /  \  | |       /  \  | |  | || | |  \| |
+#  |  ___/ / /\ \ | |      / /\ \ | |  | || | | . ` |
+#  | |    / ____ \| |____ / ____ \| |__| || |_| |\  |
+#  |_|   /_/    \_\______/_/    \_\_____/_____|_| \_|
+#
+# ====================================================
+
 """Self-contained evidence policy for the GROUND TRUTH challenge.
 
 Only :func:`ingest` is part of the submission contract.  Evidence text is
@@ -27,6 +37,8 @@ stays key-free and deterministic.  The file depends only on the standard
 library plus the official challenge types; the canary's ``google-genai``
 client is imported lazily and only when a key is actually configured.
 """
+
+
 import hashlib
 import json
 import math
@@ -889,7 +901,7 @@ def _oracle_config() -> _OracleConfig | None:
     api_key = (os.environ.get("GEMINI_API_KEY") or "").strip()
     if not api_key:
         return None
-    model = (os.environ.get("GT_GEMINI_MODEL") or "").strip() or "gemini-2.5-flash-lite"
+    model = (os.environ.get("GT_GEMINI_MODEL") or "").strip() or "gemini-3.1-flash-lite"
     try:
         timeout = float(os.environ.get("GT_LLM_TIMEOUT_SECONDS", "3.0"))
     except (TypeError, ValueError):
@@ -979,10 +991,13 @@ def _oracle_review(body: str) -> OracleVerdict | None:
         # Apply the configured request timeout when the SDK supports it, but
         # never let a version mismatch disable the oracle outright: a bounded
         # per-item request matters because ingest runs once per stream item.
+        # The API rejects deadlines under 10s, so floor the sent value there;
+        # config may still request more, up to its own 30s cap.
         try:
+            deadline_ms = max(10_000, int(config.timeout_seconds * 1000))
             client = genai.Client(
                 api_key=config.api_key,
-                http_options=genai_types.HttpOptions(timeout=int(config.timeout_seconds * 1000)),
+                http_options=genai_types.HttpOptions(timeout=deadline_ms),
             )
         except Exception:
             client = genai.Client(api_key=config.api_key)
@@ -1012,7 +1027,7 @@ def _oracle_review(body: str) -> OracleVerdict | None:
 # Scored entrypoint
 
 
-def ingest(item: EvidenceItem, view: GraphView) -> IngestResult:
+def _decide(item: EvidenceItem, view: GraphView) -> IngestResult:
     """Return a deterministic, provenance-weighted decision for one item."""
     if not isinstance(item.id, str) or not item.id or len(item.id) > 1024:
         return _no_change(item.id if isinstance(item.id, str) else "", "invalid evidence id")
@@ -1144,6 +1159,100 @@ def ingest(item: EvidenceItem, view: GraphView) -> IngestResult:
         deltas.extend(Delta("drop_claim", item.id, {"claim_id": pending_id}) for pending_id, _ in pending)
         reasons.append("cleared matching pending evidence")
     return _result(item.id, deltas, "; ".join(reasons) or "belief already saturated", min(0.98, max(0.65, provenance.score)))
+
+
+# ---------------------------------------------------------------------------
+# Exact-authorization reference monitor  (Canary Defense Plan, Phase 1)
+#
+# A final, independent gate over whatever `_decide` produced. It re-derives what
+# the trusted channel -- the graph plus the structured provenance -- permits,
+# and rejects any delta that does not conform. Its whole purpose is that no path
+# (a future edit, a subtle bug, or body text that slipped through) can emit a
+# mutation the trusted channel did not authorize. It never trusts `item.body`,
+# and on any mismatch the entire result collapses to one attributed `no_op`.
+
+
+_ALLOWED_OPS = frozenset(
+    {"no_op", "revise_confidence", "set_scope", "hold_pending", "drop_claim", "propose_axis", "propose_regime"}
+)
+
+
+def _authorized(delta: Delta, item: EvidenceItem, provenance: Provenance, domain: Any,
+                claim_ids: set[str], pending_ids: set[str]) -> bool:
+    """True iff this single delta is justified by the trusted channel alone."""
+    if delta.op not in _ALLOWED_OPS:
+        return False
+    if getattr(delta, "evidence_id", None) != item.id:  # attribution to the active item
+        return False
+    payload = delta.payload if isinstance(delta.payload, dict) else {}
+
+    if delta.op == "no_op":
+        return True
+    if delta.op == "revise_confidence":
+        cid, nc = payload.get("claim_id"), payload.get("new_confidence")
+        return (
+            cid in claim_ids
+            and isinstance(nc, (int, float))
+            and not isinstance(nc, bool)
+            and math.isfinite(nc)
+            and 0.0 <= nc <= 1.0
+        )
+    if delta.op == "set_scope":
+        cid, scope = payload.get("claim_id"), payload.get("scope")
+        if cid not in claim_ids or not isinstance(scope, dict):
+            return False
+        mechanism = provenance.mechanism
+        # The only scope write the policy ever authorizes is a mechanism-keyed
+        # exception derived from the *structured* provenance, never body text.
+        expected = {"exception_under": mechanism, f"exception_under_{mechanism}": True}
+        return scope == expected and mechanism not in {"unspecified", "observational"}
+    if delta.op == "drop_claim":
+        # A pending record can only be dropped if it already exists in the graph.
+        return payload.get("claim_id") in pending_ids
+    if delta.op == "hold_pending":
+        record = _decode_pending(payload.get("claim_id"))
+        # The token must be a well-formed pending family attributed to this item.
+        return record is not None and record.origin == _origin(item.id) and isinstance(payload.get("note"), str)
+    # propose_axis / propose_regime: the value must be a declared out-of-model
+    # axis/regime from the graph's own domain, never an arbitrary body string.
+    if domain is None:
+        return False
+    if delta.op == "propose_axis":
+        return payload.get("axis") in set(getattr(domain, "axes_excluded", ()) or ())
+    return payload.get("regime") in set(getattr(domain, "regimes_not_modeled", ()) or ())
+
+
+def _authorize(item: EvidenceItem, view: GraphView, result: IngestResult) -> IngestResult:
+    """Validate the whole delta list against the trusted channel; fail closed."""
+    try:
+        deltas = list(result.deltas)
+        if not deltas:
+            return _no_change(item.id, "authorization: empty delta list", 0.99)
+        # A single item never legitimately emits an unbounded batch of writes.
+        if len(deltas) > 12:
+            return _no_change(item.id, "authorization: delta count exceeds bound", 0.99)
+        provenance = _provenance(item)
+        domain = view.domain()
+        claim_ids = set(view.list_claim_ids())
+        pending_ids = set(view.pending_ids())
+        for delta in deltas:
+            if not _authorized(delta, item, provenance, domain, claim_ids, pending_ids):
+                return _no_change(item.id, f"authorization rejected unauthorized delta: {delta.op}", 0.99)
+        return result
+    except Exception:
+        # The reference monitor itself must never raise out of ingest.
+        return _no_change(item.id if isinstance(item.id, str) else "", "authorization monitor failed closed", 0.99)
+
+
+def ingest(item: EvidenceItem, view: GraphView) -> IngestResult:
+    """Decide, then pass the decision through the authorization monitor.
+
+    ``_decide`` is the six-stage deterministic policy (with the optional canary
+    for firewall-flagged items); ``_authorize`` is an independent final check
+    that no emitted delta exceeds what the graph and structured provenance
+    permit. Any unauthorized delta collapses the result to an attributed no_op.
+    """
+    return _authorize(item, view, _decide(item, view))
 
 
 __all__ = ["ingest"]

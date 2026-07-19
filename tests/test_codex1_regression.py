@@ -103,7 +103,12 @@ class DeterministicRegressionTests(unittest.TestCase):
         result = module.ingest(load_practice_stream()[0], load_practice_seed_view())
         self.assertEqual([delta.op for delta in result.deltas], ["no_op"])
 
-    def test_body_and_provenance_are_assessed_once_per_item(self) -> None:
+    def test_body_is_assessed_once_and_provenance_rederived_by_the_monitor(self) -> None:
+        # The untrusted body must be parsed exactly once (this is what keeps the
+        # optional canary from observing two different witnesses). The trusted
+        # structured provenance, by contrast, is deterministically re-derived a
+        # second time by the Phase-1 authorization monitor as an independent
+        # authorization record -- that re-derivation is safe and intentional.
         item = load_practice_stream()[1]
         view = load_practice_seed_view()
         original_assess = solution._assess_body
@@ -116,7 +121,7 @@ class DeterministicRegressionTests(unittest.TestCase):
             result = solution.ingest(item, view)
         self.assertIn("revise_confidence", [delta.op for delta in result.deltas])
         assess_mock.assert_called_once()
-        provenance_mock.assert_called_once()
+        self.assertEqual(provenance_mock.call_count, 2)  # decide + authorize
 
     def test_weak_independent_origins_accumulate_then_clear_exact_pending_family(self) -> None:
         provenance = {

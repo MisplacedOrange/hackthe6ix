@@ -38,6 +38,16 @@ library plus the official challenge types; the canary's ``google-genai``
 client is imported lazily and only when a key is actually configured.
 """
 
+# --- DISCLAIMER --------------------------------------------------------------
+# Scored behavior is fully DETERMINISTIC. 
+# The optional "canary" model (see`_oracle_review`) is a local-only aid
+# it activates only when a GEMINI_API_KEY is present via a git-ignored `.env`, 
+# is consulted ONLY for firewall-flagged bodies, and never contributes to firewall safety. 
+# Because the `.env` (and the key) are .gitignored, at judging no key is present and `ingest` runs the
+# pure deterministic policy -- identical safety, slightly less recall on messy-but-genuine reports. 
+# In every mode, untrusted evidence text can never mutate the graph
+# only structured provenance and the read-only view drive decisions.
+# -----------------------------------------------------------------------------
 
 import hashlib
 import json

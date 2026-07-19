@@ -322,10 +322,44 @@ _CONFUSABLES = str.maketrans(
 )
 
 
+# Characters attackers use as invisible word-splitters/joiners to break up
+# protected control-plane vocabulary (e.g. "ign<filler>ore") without leaving a
+# visible gap. None of these carry Cf/Cc category, so they survive the
+# category-based strip below unless named explicitly.
+_INVISIBLE_CHARS = {
+    0x034F,  # Combining Grapheme Joiner
+    0x115F,  # Hangul Choseong Filler
+    0x1160,  # Hangul Jungseong Filler
+    0x17B4,  # Khmer Vowel Inherent A
+    0x17B5,  # Khmer Vowel Inherent AA
+    0x180E,  # Mongolian Vowel Separator
+    0x2028,  # Line Separator
+    0x2029,  # Paragraph Separator
+    0x2060,  # Word Joiner
+    0x2061,  # Function Application
+    0x2062,  # Invisible Times
+    0x2063,  # Invisible Separator
+    0x2064,  # Invisible Plus
+    0x2800,  # Braille Pattern Blank
+    0x3164,  # Hangul Filler
+}
+
+
+def _strip_evasion_chars(value: str) -> str:
+    """Drop unassigned/surrogate/other-symbol and named invisible codepoints."""
+    return "".join(
+        character
+        for character in value
+        if unicodedata.category(character) not in {"Cn", "Cs", "So"}
+        and ord(character) not in _INVISIBLE_CHARS
+    )
+
+
 def _normalized(value: Any, *, fold_confusables: bool = False) -> str:
     if not isinstance(value, str):
         return ""
     value = unicodedata.normalize("NFKC", value)
+    value = _strip_evasion_chars(value)
     normalized_characters: list[str] = []
     for character in value:
         category = unicodedata.category(character)
@@ -362,24 +396,34 @@ _CONTROL_PATTERNS = tuple(
     re.compile(pattern, re.IGNORECASE | re.DOTALL)
     for pattern in (
         # A privileged/control role combined with an instruction container.
-        r"(?:^|[\[\(<{;:]\s*)\b(?:system|developer|assistant|processor|curator|"
+        # Matches at string start OR after any sentence boundary (.,;:!?) or bracket.
+        r"(?:^|[\[\(<{;:\.?!]\s*)\b(?:system|developer|assistant|processor|curator|"
         r"moderator|evaluator|judge)\s+(?:message|note|memo|instruction|directive|command)\b",
         # An override action combined with a protected control channel.
         r"\b(?:ignore|disregard|override|bypass|supersede)\b.{0,80}\b(?:system|developer|"
         r"assistant|processor|previous|prior|hidden|higher[ -]?priority)?\s*(?:instruction|"
-        r"instructions|rules|policy|policies|directive|command|guardrail|prompt|provenance channel)\b",
+        r"instructions|rules|policy|policies|directive|command|guardrail|prompt|provenance channel|"
+        r"provenance)\b",
         # A mutation action combined with a graph/control target. Confidence
         # interval is deliberately excluded because it is ordinary science.
-        r"\b(?:set|change|update|revise|overwrite|delete|drop|add|mutate|emit|force|mark)\b"
+        # Also catches direct claim-ID references like "set C3c" (c\d+[a-z]?).
+        r"\b(?:set|change|update\w*|revise|overwrite|delete|drop|add|mutate|emit|force|mark|"
+        r"define|output|generate)\b"
         r".{0,80}\b(?:claim|belief|knowledge graph|graph state|delta|pending item|ood flag|"
-        r"out of distribution|confidence(?!\s+interval))\b",
+        r"out of distribution|c\d+[a-z]?|confidence(?!\s+interval))\b",
         # Output shaping combined with a claim/probability target.
         r"\b(?:desired|required|target)\s+(?:answer|output|result)\b.{0,100}\b(?:probability|"
         r"claim|confidence(?!\s+interval)|belief|(?:q|c)\d+[a-z]?)\b",
+        # Passive/modal mutation ("must be set", "should be deleted", "is updated").
+        r"\b(?:must|shall|should|will|would|ought to|need to|have to|has to|is to|are to)"
+        r"\s+be\s+(?:set|updated|revised|changed|deleted|dropped|added|silenced|marked)\b",
+        # Claim-ID target before passive mutation verb ("C3c confidence is not updated").
+        r"\b(?:c\d+[a-z]?|confidence(?!\s+interval))\b.{0,60}\b(?:is|are|was|were)\s+(?:not\s+)?"
+        r"(?:updated|revised|changed|deleted|set)\b",
         # Imperative epistemic coercion at a clause boundary.
-
-        r"(?:^|[\[\(<{;:]\s*)\b(?:please|kindly)?\s*(?:accept|deem|regard|register|record|"
-        r"take)\b.{0,60}\b(?:as\s+(?:fact|true|established|certain|ground truth|gospel)|for granted)\b",
+        r"(?:^|[\[\(<{;\.?!:]\s*)\b(?:please|kindly)?\s*(?:accept|deem|regard|register|record|"
+        r"take|conclude|declare|assert)\b.{0,60}\b(?:as\s+(?:fact|true|established|certain|"
+        r"ground truth|gospel)|for granted)\b",
     )
 )
 
@@ -390,6 +434,7 @@ def _direct_control_attempt(body: str) -> bool:
     # line layout readable; this form joins vocabulary split by any Cc/Cf code
     # point (including tab/newline inserted inside a protected word).
     compact = unicodedata.normalize("NFKC", body)
+    compact = _strip_evasion_chars(compact)
     compact = "".join(
         character
         for character in compact
@@ -444,10 +489,18 @@ def _speech_act(clause: str) -> SpeechAct:
         text,
     ):
         return SpeechAct.QUESTION
+    # Counterfactual / conditional frames: these are never admissible as
+    # experimental results. A claim about what "would" happen under a
+    # condition that was never actually applied is hypothesis, not evidence.
     if re.search(
         r"\b(?:hypothesis|hypothesized|speculated|proposal|proposed mechanism|"
         r"designed to test|aimed to test|future work|might|may have|could potentially|"
-        r"suppose|imagined scenario)\b",
+        r"suppose|imagined scenario)\b|"
+        r"\bif\b|"
+        r"\bwere\s+(?:the|this|these|it)\b|"
+        r"\bhad\s+(?:it|this|that)\s+been\b|"
+        r"\bin\s+(?:principle|theory|a hypothetical)\b|"
+        r"\bwould\s+(?:have|be|not)\b",
         text,
     ):
         return SpeechAct.HYPOTHESIS
@@ -501,8 +554,22 @@ def _strip_quoted_material(text: str) -> tuple[str, bool]:
     return result, quoted
 
 
+_COORDINATING_CONCESSIVE = re.compile(
+    r",\s*(?=(?:though|although|whereas|even as|while|but)\b)", re.IGNORECASE
+)
+
+
 def _split_clauses(body: str) -> list[str]:
     text = _normalized(body).replace("_", " ")
+    # A comma followed by a concessive/contrastive connective ("though",
+    # "although", "whereas", "even as", "while", "but") introduces an
+    # independent proposition, e.g. "X reversed, though an unrelated assay
+    # failed to replicate" is two atomic claims about two different subjects,
+    # not one. Left unsplit, a denial/failed-replication predicate about the
+    # OTHER subject gets scanned as part of the primary event's clause and
+    # flips its polarity (redteam rounds 10-11). Promoting the comma to a
+    # semicolon reuses the segmentation that already isolates these cases.
+    text = _COORDINATING_CONCESSIVE.sub("; ", text)
     # Semicolons and sentence boundaries separate event attachment. Colons stay
     # inside a clause so role/directive prefixes remain visible to the gate.
     parts = re.split(r"(?<=[.!?;])\s+|\s*;\s*", text)
@@ -821,8 +888,8 @@ def _state_mentions(clause: str, view: GraphView) -> tuple[StateMention, ...]:
         r"\b(?:induced )?pluripotent(?: stem)? cells?\b": "PluripotentStemCell",
         r"\bips cells?\b|\bipscs?\b": "PluripotentStemCell",
         r"\bstem cells?\b": "PluripotentStemCell",
-        r"\b(?:pluripotent|stem[ -]?like) (?:state|identity|phenotype)\b": "PluripotentStemCell",
-        r"\bstemness\b": "PluripotentStemCell",
+        r"\b(?:pluripotent(?:[ -]?like)?|stem[ -]?like) (?:state|identity|phenotype)\b": "PluripotentStemCell",
+        r"\bstemness\b|\bpluripotency\b": "PluripotentStemCell",
         r"\bmuscle cells?\b|\bskeletal muscle\b": "SkeletalMuscleCell",
         r"\bintestinal(?: epithelial)? cells?\b": "IntestinalEpithelialCell",
     }
@@ -866,6 +933,8 @@ _PASSIVE_FROM_FRAME = re.compile(
     r"(?:produced|generated|derived|obtained|created|induced)\s+from\b"
 )
 
+_TRAILING_EXCLUSION_KEYWORD = re.compile(r"\bwithout\b|\bskipp\w*\b|\bbypass\w*\b", re.IGNORECASE)
+
 
 def _role_states(
     clause: str,
@@ -874,6 +943,20 @@ def _role_states(
 ) -> tuple[Any | None, Any | None, bool]:
     if not mentions:
         return None, None, False
+
+    # A trailing exclusion clause ("... without passing through any
+    # intermediate or pluripotent state") names a state that explicitly did
+    # NOT occur -- it is not a third participant in the transition. Left in,
+    # it inflates the distinct-state count past the >2 threshold used below
+    # to detect genuinely ambiguous multi-actor sentences, which wrongly
+    # abstains on real lateral-conversion (OOD regime) results. Only trim
+    # mentions found AFTER the predicate, so a leading adverbial ("Without
+    # any stimulus, X converted into Y") does not lose its real participants.
+    negation = _TRAILING_EXCLUSION_KEYWORD.search(clause, predicate_start)
+    if negation is not None:
+        trimmed = tuple(m for m in mentions if m.start < negation.start())
+        if trimmed:
+            mentions = trimmed
 
     passive = _PASSIVE_FROM_FRAME.search(clause)
     if passive is not None:
@@ -900,7 +983,11 @@ def _denied_near(clause: str, predicate_start: int) -> bool:
     combined = clause[max(0, predicate_start - 120) : predicate_start + 100]
     if re.search(
         r"\b(?:unable to|failed to|could not|cannot|can not|did not|does not|do not|"
-        r"never|no evidence (?:that|of)|without evidence (?:that|of)|was not|were not)\b",
+        # "never" negates the predicate that follows it, but "never-before-seen/
+        # -observed/-reported" is a hedge meaning "novel", not a denial -- the
+        # lookahead keeps that idiom from flipping an affirmed result to DENIED.
+        r"never(?!-?\s*before)|"
+        r"no evidence (?:that|of)|without evidence (?:that|of)|was not|were not)\b",
         prefix,
     ):
         return True
@@ -936,10 +1023,11 @@ def _identity_preserved(clause: str) -> bool:
             clause,
         )
         or re.search(
-            r"\b(?:without changing|without altering|while retaining|while preserving|kept the same)"
+            r"\b(?:without changing|without altering|while retaining|while preserving|while remaining|kept the same)"
             r".{0,25}\b(?:identity|cell type|lineage)\b",
             clause,
         )
+        or re.search(r"\bwhile\s+remaining\s+\w+\b", clause)
     )
 
 

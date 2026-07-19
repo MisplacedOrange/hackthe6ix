@@ -62,3 +62,44 @@ adversarial corpus, 24 metamorphic probes, all unit/integration tests,
 compile-all, anti-bypass scans, and hash-seed demo determinism on Python 3.10,
 3.11, and 3.13. Passing these checks demonstrates containment for the tested
 threat model; it does not establish scientific truth or authenticated lineage.
+
+## Hardening changelog
+
+A 20-item predicted-hidden-stream fixture (`adversarial/predicted_hidden_*.json`,
+built from the spec's four capabilities, the seed graph's declared blind spots,
+and prior red-team findings) surfaced real gaps, since fixed:
+
+- **State-alias coverage.** `pluripotent-like state` and bare `pluripotency`
+  were not recognized as naming the pluripotent state, so otherwise clean,
+  strongly-provenanced contradictions silently produced no revision at all.
+- **Comma-joined sign-flip (closes redteam R10/R11).** A distractor clause
+  about an unrelated experiment, comma-joined into the same sentence as a
+  real contradiction (`"...returned to a pluripotent state, though an
+  unrelated assay failed to replicate"`), previously flipped the revision's
+  sign. Coordinating/concessive commas (though, although, whereas, while,
+  but) now split into their own clause before polarity is read.
+- **Role-ambiguity false trigger.** A trailing exclusion clause naming what
+  did *not* happen (`"...without passing through any intermediate or
+  pluripotent state"`) was counted as a third participant, wrongly
+  suppressing genuine lateral-conversion (OOD regime) detection.
+- **Negation-idiom false trigger.** `"never-before-seen"` (a common hedge
+  meaning "novel") tripped the bare `never` denial check, scoring a
+  confirmation as a contradiction.
+- **Counterfactual-as-evidence.** `"If a defined factor were applied, cells
+  would return to a pluripotent state"` was read as an observed result. Such
+  conditional/counterfactual framing is now classified as hypothesis, never
+  as evidence.
+- **Unicode evasion.** Normalization now strips unassigned/surrogate/other-
+  symbol codepoints and a named set of invisible joiners/fillers, applied
+  consistently to both the control-pattern detection paths (previously one
+  path was hardened and the other was not).
+- **Control-pattern coverage.** Widened to match mid-sentence (not just
+  bracket-led) role/instruction phrasing, bare "provenance" as an override
+  target, direct claim-ID references (`set C3c`), and passive/modal mutation
+  phrasing (`"C3c confidence is updated"`, `"must be set"`).
+
+Rejected: a set of unused "mathematical foundations" helpers (cosine
+similarity, Bayes posterior, isolation-forest scoring, AST-based checks)
+proposed on another branch. `ingest()` never calls them, so they cannot
+affect any scored capability — pure surface area with no performance
+benefit, and excluded on that basis.

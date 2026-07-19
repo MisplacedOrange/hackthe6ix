@@ -46,7 +46,7 @@ The evaluation feeds your function a stream of results, one at a time, in order.
 That decision policy is the entire challenge: how you read the strength of a result, how far you move a belief, how you tell a real contradiction apart from something outside your model, and how you refuse to be manipulated by the text.
 
 - **Deliverable:** your filled-in `ingest` function, plus a one-page `DESIGN.md` describing how it weighs evidence and how it enforces the firewall.
-- **How you develop it:** run `python selfcheck.py` against the six-item practice sandbox, which has a public answer key, and iterate until your instincts are right.
+- **How you develop it:** exercise `ingest` locally against representative evidence streams and verify every mutation is a legal `Delta`.
 - **How it is judged:** your function is run against a larger, harder stream you do not see until after submissions close, and scored on the four capabilities below.
 
 The rest of this README is the detail behind that: the concepts you need, the exact interface, and precisely what the four capabilities mean.
@@ -192,15 +192,11 @@ should update.
 git clone https://github.com/riyabhargava11/ground-truth-challenge.git
 cd ground-truth-challenge
 python --version        # need 3.10+
-python selfcheck.py     # runs the starter against the practice sandbox
-python adversarial/run_predicted.py
-python -m pytest -q
+python -m py_compile starter/my_solution.py
 ```
 
-Then open `starter/my_solution.py` and implement `ingest`. Re-run `selfcheck.py`
-until the practice checks pass. The practice sandbox contains one clean example of
-each tested behavior, with a public answer key, so you can build the right instincts
-before facing the harder hidden set.
+Then open `starter/my_solution.py` and implement `ingest`. The scored harness and
+hidden evidence stream are supplied by the organizers at judging time.
 
 ---
 
@@ -216,17 +212,11 @@ groundtruth/              the framework you build against (do not edit)
   loader.py               loads the data
   data/
     seed.json             the starting belief graph (your input)
-    practice_seed.json    a small sandbox graph
-    practice_stream.json  practice items (separate from the scored set)
-    practice_reference.json  the public answer key for the sandbox
 starter/my_solution.py    the scoring policy, incl. the inlined sacrificial oracle (see DESIGN.md)
-tests/                    deterministic policy and oracle-routing regression tests
-selfcheck.py              run your solution on the practice sandbox
-public_scorer.py          the practice self-check (not the scored harness)
+starter/.env.example      local configuration template for the optional oracle
 WHAT_IS_TESTED.md         the detailed specification
 RULES.md                  eligibility, allowed tools, submission, judging
 examples/                 an annotated single-item walkthrough
-.env.example              local configuration template for the optional oracle
 ```
 
 The hidden evaluation stream, the calibrated scoring bands, and any reference

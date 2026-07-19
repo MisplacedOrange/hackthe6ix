@@ -102,6 +102,5 @@ lazy shortcuts (believe-the-latest, ignore-everything, flag-everything,
 trust-the-body) each fail on at least one item. A submission that only does three
 of the four well is visibly separable from one that does all four.
 
-You can develop the right instincts on the **practice sandbox** (`selfcheck.py`),
-which contains one clean example of each behavior with a public answer key. The
-scored set uses different, harder items you will not see until judging.
+Develop against representative local cases covering each behavior. The scored set
+uses different, harder items you will not see until judging.

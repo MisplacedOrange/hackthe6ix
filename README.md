@@ -4,6 +4,10 @@ Paladin is a provenance-aware scientific belief-revision engine. It processes ev
 
 The system is designed around a strict firewall: incoming text is untrusted, while structured provenance controls evidence weight and the graph remains read-only to the policy. Paladin also detects out-of-distribution evidence, tracks weak results as pending, and rejects control-plane instructions embedded in reports.
 
+## Architecture
+
+![Paladin evidence intake and belief-revision flowchart](image.png)
+
 ## Gemini integration
 
 Paladin optionally uses Gemini through the `google-genai` SDK as a sacrificial canary for malformed or ambiguous evidence. Gemini receives only the report body and returns a closed JSON verdict (`benign`, `injection`, or `abstain`) with supporting quotes. The response is grounded against the original text, and Gemini cannot create deltas, choose confidence values, access graph state, or bypass the deterministic policy.

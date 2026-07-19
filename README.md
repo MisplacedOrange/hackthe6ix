@@ -8,6 +8,14 @@ The system is designed around a strict firewall: incoming text is untrusted, whi
 
 ![Paladin evidence intake and belief-revision flowchart](image.png)
 
+## Practice validation
+
+The chart below is generated from a live run of the six public practice cases.
+It compares the policy's behavior with the public reference, shows the authorized
+deltas returned for each item, and tracks belief confidence through the stream.
+
+![Paladin public practice-suite results](policy-practice-results.png)
+
 ## Gemini integration
 
 Paladin optionally uses Gemini through the `google-genai` SDK as a sacrificial canary for malformed or ambiguous evidence. Gemini receives only the report body and returns a closed JSON verdict (`benign`, `injection`, or `abstain`) with supporting quotes. The response is grounded against the original text, and Gemini cannot create deltas, choose confidence values, access graph state, or bypass the deterministic policy.

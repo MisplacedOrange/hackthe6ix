@@ -193,8 +193,8 @@ git clone https://github.com/riyabhargava11/ground-truth-challenge.git
 cd ground-truth-challenge
 python --version        # need 3.10+
 python selfcheck.py     # runs the starter against the practice sandbox
-python adversarial/run_adversarial.py starter/my_solution.py
-python -m unittest discover -s tests -v
+python adversarial/run_predicted.py
+python -m pytest -q
 ```
 
 Then open `starter/my_solution.py` and implement `ingest`. Re-run `selfcheck.py`
@@ -219,18 +219,14 @@ groundtruth/              the framework you build against (do not edit)
     practice_seed.json    a small sandbox graph
     practice_stream.json  practice items (separate from the scored set)
     practice_reference.json  the public answer key for the sandbox
-starter/my_solution.py    the scoring policy entrypoint
-starter/epistemic_core.py policy contracts, accumulation, receipts, preflight
-starter/harness_guard.py  submission-safe structural guard
-reasoning_graph/          versioned, replayable scientific judgment sidecar
-scientific_harness/       sensors, context, reviewer, rules, adapters
-demo/                     deterministic offline harness replay
-tests/                    workstream and cross-workstream regression tests
+starter/my_solution.py    the scoring policy, incl. the inlined sacrificial oracle (see DESIGN.md)
+tests/                    deterministic policy and oracle-routing regression tests
 selfcheck.py              run your solution on the practice sandbox
 public_scorer.py          the practice self-check (not the scored harness)
 WHAT_IS_TESTED.md         the detailed specification
 RULES.md                  eligibility, allowed tools, submission, judging
 examples/                 an annotated single-item walkthrough
+.env.example              local configuration template for the optional oracle
 ```
 
 The hidden evaluation stream, the calibrated scoring bands, and any reference
@@ -241,12 +237,13 @@ run only at judging.
 
 ## Rules, briefly
 
-Python 3.10+; the standard library is enough. The scored submission remains
-`starter/my_solution.py` plus its self-contained helper. The reasoning graph and
-harness are non-scoring sidecar code and never become imports of the scored path.
-Teams of 1 to 4. One submission per team includes the one-page `DESIGN.md` and
-the regression matrix described in the implementation plan. Full challenge
-constraints remain in `RULES.md`.
+Python 3.10+; the standard library is enough. The scored implementation is the
+single self-contained `starter/my_solution.py`, deterministic by default; its
+inlined sacrificial oracle only affects firewall-flagged bodies, requires a
+`GEMINI_API_KEY` to activate, and fails closed to the same deterministic
+behavior without one. Teams of 1 to 4. One submission per team
+includes those files and the one-page `DESIGN.md`. Full challenge constraints
+remain in `RULES.md`.
 
 ---
 

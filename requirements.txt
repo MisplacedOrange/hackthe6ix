@@ -1,3 +1,9 @@
-# GROUND TRUTH runs on the Python standard library alone.
-# If your solution calls an LLM, add its client here, e.g.:
-# anthropic>=0.40
+# GROUND TRUTH runs on the Python standard library alone. The deterministic
+# policy in starter/my_solution.py needs nothing below this line and behaves
+# identically without it.
+#
+# Optional: only needed if you set GEMINI_API_KEY to enable the sacrificial
+# oracle review of firewall-flagged (malformed/ambiguous) bodies described in
+# DESIGN.md. Absent this package, the inlined oracle in starter/my_solution.py
+# fails closed and the policy runs exactly as if it were never installed.
+# google-genai>=1.0

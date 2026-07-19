@@ -2,104 +2,93 @@
 
 ## Trust boundary
 
-`starter/my_solution.py` is the scored policy. It reads an untrusted evidence
-body and a trusted structured provenance channel, then returns only attributed,
-closed-vocabulary `Delta` objects. It never writes through `GraphView`, imports
-the sidecar, reads `item.tag`, or uses network/model state. `groundtruth/` is
-unchanged and remains the only mutation API.
+`starter/my_solution.py` contains the complete scored policy. `ingest` reads a
+read-only graph, treats `item.body` as untrusted text, and treats structured
+`item.provenance` as the only evidence-quality channel. It never reads
+`item.tag` or mutates the graph directly; every decision is returned as an
+attributed member of the framework's closed `Delta` vocabulary. It may, for a
+narrow, firewall-flagged minority of items, consult an optional model (see
+"Canary model review" below) — that model has no graph, provenance, or
+mutation access of its own and cannot itself change what a deterministic gate
+would otherwise decide.
 
-Body text may suggest a clause-local semantic event, but it cannot name a claim,
-operation, confidence, scope key, or evidence weight. Unicode normalization,
-control/instruction detection, quotation handling, speech-act filtering, and
-closed semantic extraction happen before provenance admission. Unknown enums,
-invalid types, ambiguous events, and malformed identifiers fail closed as an
-attributed `no_op`.
+The body is Unicode-normalized before inspection. Composite control-plane
+instructions, imperatives, questions, hypotheses, conflicting events, unknown
+states, and ambiguous endpoint roles fail closed as an attributed `no_op`.
+Text may identify a scientific event, but it cannot choose claim IDs,
+operations, confidence values, scope keys, provenance weight, or OOD status.
+Detected control-plane instructions are an absolute gate: no verdict from any
+model can ever clear that flag.
 
-## Calibrated revision
+## Evidence weighting and revision
 
-`starter/epistemic_core.py` defines immutable lab/claim contracts, provenance
-weights, strict pending codecs, aggregation, bounded revisions, receipts, and
-semantic preflight. Thin contradictions are held as fully anchored
-`pending__v3__...` records containing quantized evidence quality and an origin
-fingerprint. Only distinct origins contribute; duplicate IDs, malformed tokens,
-ambiguous retractions, and cross-family replays cannot mutate state. Legacy v2
-records migrate as one conservative source. Four sequential reports and an
-equivalent packet use the same bounded aggregate and diminishing returns.
+Provenance fields use bounded count grammars and closed aliases for directness,
+effect strength, method class, and retraction status. Invalid metadata fails
+closed. Accepted evidence receives a deterministic score with weights of 40%
+independent groups, 15% replications, 20% directness, 15% effect, and 10% method
+reliability. Counts saturate to give diminishing returns.
 
-Every result carries one closed evidence class and a stable observable receipt
-with the event, target(s), quality, provenance status, prior/posterior, bounded
-log-odds movement, pending count, and selected action. Preflight rejects
-unattributed or duplicate revisions, invalid pending drops, unapproved scope,
-OOD/in-model mixtures, non-finite values, and any operation outside the closed
-contract.
+Credible in-model evidence updates confidence in bounded log-odds. Strong
+contradictions move more than confirmations, while already-high confirmations
+receive only a small nudge. Strong mechanism-specific contradictions also add a
+scope exception instead of deleting the general belief.
 
-## Reasoning sidecar
+Thin extraordinary contradictions are held as versioned pending records. Each
+record contains only a semantic fingerprint, quantized structured provenance,
+and a hash of the trusted evidence ID. Four distinct compatible origins can
+promote a pending family; duplicate origins do not accumulate. Retractions and
+failed replications can drop only one exactly matching pending family.
 
-`reasoning_graph/` is non-scoring standard-library code. It stores typed,
-versioned nodes and edges through an append-only hash-chained journal with
-atomic SQLite transactions, snapshots, replay, correction history, and
-fail-closed serialization. It answers why/history, prediction provenance,
-contradictions, open questions, context rules/failures, consensus divergence,
-and invalidation impact. Local hashes detect tampering but are not signatures;
-provenance is unverified unless an external boundary supplies authentication.
+## Canary model review
 
-Working, episodic, semantic, and personalized memory are separate. Personal
-beliefs are owner-scoped and never silently become lab consensus. Recorder
-events preserve proposed/rejected operations as audit facts; only applied
-operations can create authoritative belief edges.
+The decision flow is: input → deterministic policy → **YES** (intake), **NO**
+(omit), or **UNSURE** → canary model → deterministic policy again → **YES**
+(intake) / **NO** (omit). "UNSURE" is a body the deterministic parser could
+not cleanly classify — unbalanced delimiters, or more than one candidate event
+— and only those items reach the sacrificial "canary" model inlined in
+`starter/my_solution.py` (`_oracle_review`). The injection gate above is a
+confident **NO**, never routed to the canary: a regex-caught control-plane
+attempt cannot be argued back in.
 
-`scientific_harness/` adds deterministic handoff sensors, labelled context
-assembly, a read-only reviewer, human-gated rule candidates, audit/reporting,
-and a public-interface-only challenge adapter. `starter/harness_guard.py`
-preserves valid scored results and converts exceptions or structurally invalid
-results into attributed no-ops. `demo/` replays pending evidence, corroboration,
-why/provenance, injection, OOD, dissent, rule review, and invalidation offline.
+The canary gets only the raw body and generic task instructions, never
+provenance, graph state, claim IDs, or the mutation API, and its JSON schema
+has no field for a confidence value, claim ID, or delta — only a closed
+`benign`/`injection`/`abstain` verdict plus verbatim supporting quotes. It
+proposes nothing. Its output is then re-checked by the deterministic policy:
+every quote must verify against the actual body (an ungrounded quote downgrades
+to `abstain`), and admission additionally requires the deterministic parser to
+have *independently* resolved exactly one eligible event. So the canary can
+only license a structurally-noisy-but-genuine single event onto the same intake
+pipeline every clean **YES** uses; it can never manufacture an event, and
+multi-event ("ambiguous") bodies always resolve to **NO** regardless of the
+verdict. Everything that is not admitted ends in the same `no_op` the
+deterministic policy would already return, with the verdict appended to the
+rationale for audit.
+
+The canary is unavailable without `GEMINI_API_KEY`, and `GT_LLM_MODE=off`
+disables it even with a key present. Missing dependency, timeout, malformed
+JSON, or an unrecognized field all resolve to "unavailable," not a raise —
+`ingest` stays byte-identical to the deterministic policy whenever the canary
+can't be consulted. The key is read from the environment; a git-ignored `.env`
+placed next to `my_solution.py` is auto-loaded for local use, and because it is
+never committed, judging runs key-free and deterministic. See
+`LLM_SACRIFICE_IMPLEMENTATION_PLAN.md` and `.env.example` for the fuller threat
+model and configuration surface.
+
+## Out-of-distribution handling
+
+Endpoint topology is resolved from graph cell states. A credible direct
+cross-lineage transition with no intermediate proposes the declared
+`lateral_somatic_conversion` regime. An identity-preserving change on a property
+listed in the domain's excluded axes proposes that axis. Potency reversals and
+adjacent or same-lineage transitions remain in-model and revise claims rather
+than being mislabeled OOD.
 
 ## Verification
 
-The integration matrix runs the practice self-check, public scorer, 62-case
-adversarial corpus, 24 metamorphic probes, all unit/integration tests,
-compile-all, anti-bypass scans, and hash-seed demo determinism on Python 3.10,
-3.11, and 3.13. Passing these checks demonstrates containment for the tested
-threat model; it does not establish scientific truth or authenticated lineage.
-
-## Hardening changelog
-
-A 20-item predicted-hidden-stream fixture (`adversarial/predicted_hidden_*.json`,
-built from the spec's four capabilities, the seed graph's declared blind spots,
-and prior red-team findings) surfaced real gaps, since fixed:
-
-- **State-alias coverage.** `pluripotent-like state` and bare `pluripotency`
-  were not recognized as naming the pluripotent state, so otherwise clean,
-  strongly-provenanced contradictions silently produced no revision at all.
-- **Comma-joined sign-flip (closes redteam R10/R11).** A distractor clause
-  about an unrelated experiment, comma-joined into the same sentence as a
-  real contradiction (`"...returned to a pluripotent state, though an
-  unrelated assay failed to replicate"`), previously flipped the revision's
-  sign. Coordinating/concessive commas (though, although, whereas, while,
-  but) now split into their own clause before polarity is read.
-- **Role-ambiguity false trigger.** A trailing exclusion clause naming what
-  did *not* happen (`"...without passing through any intermediate or
-  pluripotent state"`) was counted as a third participant, wrongly
-  suppressing genuine lateral-conversion (OOD regime) detection.
-- **Negation-idiom false trigger.** `"never-before-seen"` (a common hedge
-  meaning "novel") tripped the bare `never` denial check, scoring a
-  confirmation as a contradiction.
-- **Counterfactual-as-evidence.** `"If a defined factor were applied, cells
-  would return to a pluripotent state"` was read as an observed result. Such
-  conditional/counterfactual framing is now classified as hypothesis, never
-  as evidence.
-- **Unicode evasion.** Normalization now strips unassigned/surrogate/other-
-  symbol codepoints and a named set of invisible joiners/fillers, applied
-  consistently to both the control-pattern detection paths (previously one
-  path was hardened and the other was not).
-- **Control-pattern coverage.** Widened to match mid-sentence (not just
-  bracket-led) role/instruction phrasing, bare "provenance" as an override
-  target, direct claim-ID references (`set C3c`), and passive/modal mutation
-  phrasing (`"C3c confidence is updated"`, `"must be set"`).
-
-Rejected: a set of unused "mathematical foundations" helpers (cosine
-similarity, Bayes posterior, isolation-forest scoring, AST-based checks)
-proposed on another branch. `ingest()` never calls them, so they cannot
-affect any scored capability — pure surface area with no performance
-benefit, and excluded on that basis.
+The public practice scorer, the 20-item predicted stream, direct-file loading,
+duplicate-origin handling, pending accumulation, exact pending invalidation,
+and the canary-model routing/verification/fail-closed behavior above are
+regression tested (`python -m pytest -q`). The scored path uses only the
+Python standard library and the official challenge types; `google-genai` is
+an optional dependency of the canary path alone and is never required.
